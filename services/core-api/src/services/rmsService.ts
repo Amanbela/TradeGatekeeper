@@ -1,6 +1,7 @@
 import moment from 'moment-timezone';
 import { RMSCheckResult } from '../types';
-import { isDailyTradeLocked } from '../config/redis';
+import { isDailyTradeLocked, isKillSwitchActive } from '../config/redis';
+import { getCandleManager } from '../engine/candleManager';
 
 export class RMSService {
   // Pre-configured RBI Policy & Key Event dates (YYYY-MM-DD in IST)
@@ -24,6 +25,26 @@ export class RMSService {
    * Evaluates all RMS rules before executing a trade.
    */
   public static async evaluateRMS(symbol: string): Promise<RMSCheckResult> {
+    // 0a. Emergency Manual Kill Switch Check
+    const manualKillSwitch = await isKillSwitchActive();
+    if (manualKillSwitch) {
+      return {
+        allowed: false,
+        reason: 'MANUAL_KILL_SWITCH_ACTIVE: Emergency manual kill switch is ON',
+      };
+    }
+
+    // 0b. WebSocket Stale Data Kill Switch Check (>30 seconds without ticks)
+    const candleMgr = getCandleManager(symbol);
+    if (!candleMgr.isTickFeedFresh(30000)) {
+      const lastTick = candleMgr.getLastTickTimestamp();
+      const elapsedSec = lastTick > 0 ? ((Date.now() - lastTick) / 1000).toFixed(1) : 'infinity';
+      return {
+        allowed: false,
+        reason: `STALE_DATA_KILL_SWITCH: No WebSocket ticks received for ${elapsedSec} seconds`,
+      };
+    }
+
     const nowIST = moment().tz('Asia/Kolkata');
     const dateStr = nowIST.format('YYYY-MM-DD');
 
@@ -38,16 +59,15 @@ export class RMSService {
     // Rule 2: Momentum Windows (09:30 AM - 11:15 AM IST and 01:30 PM - 02:45 PM IST)
     const currentMinutes = nowIST.hours() * 60 + nowIST.minutes();
 
-    const morningStart = 9 * 60 + 30;  // 09:30 AM = 570 mins
-    const morningEnd = 11 * 60 + 15;   // 11:15 AM = 675 mins
+    const morningStart = 9 * 60 + 30; // 09:30 AM = 570 mins
+    const morningEnd = 11 * 60 + 15; // 11:15 AM = 675 mins
     const afternoonStart = 13 * 60 + 30; // 01:30 PM = 810 mins
-    const afternoonEnd = 14 * 60 + 45;   // 02:45 PM = 885 mins
+    const afternoonEnd = 14 * 60 + 45; // 02:45 PM = 885 mins
 
     const isInMorningWindow = currentMinutes >= morningStart && currentMinutes <= morningEnd;
     const isInAfternoonWindow = currentMinutes >= afternoonStart && currentMinutes <= afternoonEnd;
 
     if (!isInMorningWindow && !isInAfternoonWindow) {
-      // Allow bypass in non-production/test environments if FORCE_RMS_BYPASS is true
       if (process.env.FORCE_RMS_BYPASS !== 'true') {
         return {
           allowed: false,

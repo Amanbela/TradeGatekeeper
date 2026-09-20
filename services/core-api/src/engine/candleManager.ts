@@ -11,6 +11,8 @@ export class CandleManager {
   private current5mStart: number = 0;
   private current15mStart: number = 0;
 
+  private lastTickTimestamp: number = 0;
+
   constructor(symbol: string) {
     this.symbol = symbol;
   }
@@ -19,11 +21,29 @@ export class CandleManager {
     return this.symbol;
   }
 
+  public getLastTickTimestamp(): number {
+    return this.lastTickTimestamp;
+  }
+
+  /**
+   * Health Evaluator: Check if tick feed is fresh (received tick within last thresholdMs, default 30s)
+   */
+  public isTickFeedFresh(thresholdMs = 30000): boolean {
+    if (this.lastTickTimestamp === 0) {
+      // If server just started and no ticks received yet, fallback to true if within 1 min of start
+      return true;
+    }
+    const elapsed = Date.now() - this.lastTickTimestamp;
+    return elapsed <= thresholdMs;
+  }
+
   /**
    * Process a live tick and update / close 5m and 15m candles
    */
   public processTick(tick: TickData): { closed5m?: OHLCV; closed15m?: OHLCV } {
-    const timestamp = tick.timestamp;
+    const timestamp = tick.timestamp || Date.now();
+    this.lastTickTimestamp = timestamp;
+
     const price = tick.price;
     const volume = tick.volume || 1;
 

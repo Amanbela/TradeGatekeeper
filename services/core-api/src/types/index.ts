@@ -1,6 +1,16 @@
 export type TradeAction = 'BUY' | 'SELL';
+export type OptionDirection = 'CALL' | 'PUT';
 export type TradeStatus = 'OPEN' | 'CLOSED' | 'REJECTED';
-export type TradeOutcome = 'TARGET_HIT' | 'SL_HIT' | 'TIME_EXIT' | 'NONE';
+
+export type TradeState =
+  | 'SIGNAL_DETECTED'
+  | 'RISK_APPROVED'
+  | 'ORDER_PLACED'
+  | 'POSITION_OPEN'
+  | 'EXIT_TRIGGERED'
+  | 'POSITION_CLOSED';
+
+export type TradeOutcome = 'TARGET_HIT' | 'SL_HIT' | 'TIME_EXIT' | 'FORCE_EXIT' | 'NONE';
 
 export interface TickData {
   symbol: string;
@@ -28,6 +38,7 @@ export interface SignalPayload {
   oiBuildupScore?: number;
   strikePrice?: number;
   optionType?: 'CE' | 'PE';
+  selectedStrike?: string;
 }
 
 export interface IndicatorResult {
@@ -38,10 +49,21 @@ export interface IndicatorResult {
   htf200Ema: number;
   adx: number;
   volumeRatio: number;
+  volumeSma20: number;
   emaCrossInLast4: boolean;
   rsiTriggered: boolean;
   isValidEntry: boolean;
   rejectionReason?: string;
+}
+
+export interface FilterChecks {
+  htfEmaPass: boolean;
+  adxPass: boolean;
+  volumeSurgePass: boolean;
+  rmsWindowPass: boolean;
+  dailyLimitPass: boolean;
+  staleDataPass: boolean;
+  killSwitchPass: boolean;
 }
 
 export interface MlFeatureVector {
@@ -75,9 +97,29 @@ export interface ActivePosition {
   token: string;
   action: TradeAction;
   entryPrice: number;
+  grossEntryPrice: number;
   targetPrice: number;
   stopLossPrice: number;
   entryTimestamp: number;
   maxHoldTimeMinutes: number;
   featureVector: MlFeatureVector;
+  quantity: number;
+  selectedStrike: string;
+}
+
+export interface FinancialFrictions {
+  slippagePercent: number;
+  grossEntryPrice: number;
+  netEntryPrice: number;
+  grossExitPrice: number;
+  netExitPrice: number;
+  quantity: number;
+  grossPnLPoints: number;
+  grossPnLAmount: number;
+  brokerage: number;
+  sttTax: number;
+  exchangeCharges: number;
+  stampDuty: number;
+  totalTaxesAndCharges: number;
+  netRealizedPnL: number;
 }

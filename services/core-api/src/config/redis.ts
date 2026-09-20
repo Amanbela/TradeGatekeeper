@@ -62,3 +62,17 @@ export async function getLastExitTimestamp(symbol: string): Promise<number | nul
   const val = await redis.get(key);
   return val ? parseInt(val, 10) : null;
 }
+
+/**
+ * Emergency Manual Kill Switch toggle in Redis
+ * Key format: KILL_SWITCH_ACTIVE ('true' | 'false')
+ */
+export async function setKillSwitchState(active: boolean): Promise<void> {
+  await redis.set('KILL_SWITCH_ACTIVE', active ? 'true' : 'false');
+  console.log(`[Redis] Emergency Kill Switch set to ${active ? 'ACTIVE (TRUE)' : 'INACTIVE (FALSE)'}`);
+}
+
+export async function isKillSwitchActive(): Promise<boolean> {
+  const val = await redis.get('KILL_SWITCH_ACTIVE');
+  return val === 'true';
+}

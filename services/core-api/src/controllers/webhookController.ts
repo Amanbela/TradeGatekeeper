@@ -1,12 +1,13 @@
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { SignalPayload, MlFeatureVector } from '../types';
+import moment from 'moment-timezone';
+import { SignalPayload, MlFeatureVector, FilterChecks, OHLCV } from '../types';
 import { RMSService } from '../services/rmsService';
 import { getCandleManager } from '../engine/candleManager';
 import { GainzAlgoEngine } from '../engine/gainzAlgoEngine';
 import { OptionFilters } from '../engine/optionFilters';
 import { MlClient } from '../services/mlClient';
-import { acquireDailyTradeLock, getTodayISTDateString } from '../config/redis';
+import { acquireDailyTradeLock, getTodayISTDateString, isKillSwitchActive } from '../config/redis';
 import { SignalModel } from '../models/Signal';
 import { PaperTradeModel } from '../models/PaperTrade';
 import { TrackerWorker } from '../services/trackerWorker';
@@ -23,23 +24,61 @@ export class WebhookController {
       return;
     }
 
-    console.log(`[Webhook] Ingesting Signal: ${action} ${symbol} @ ${price}`);
+    const signalId = uuidv4();
+    const now = new Date();
+    const timestampEpoch = now.getTime();
+    const timestampIST = moment(now).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss [IST]');
+    const direction = action === 'BUY' ? 'CALL' : 'PUT';
+    const strike = payload.selectedStrike || `${symbol} ${Math.round(price / 50) * 50} ${direction === 'CALL' ? 'CE' : 'PE'}`;
+
+    console.log(`[Webhook] Ingesting Signal [${signalId}]: ${action} (${direction}) ${symbol} @ ${price}`);
+
+    const candleMgr = getCandleManager(symbol);
+    const candles5m = candleMgr.get5mCandles();
+    const candles15m = candleMgr.get15mCandles();
+    const latestCandle: OHLCV | undefined = candles5m.length > 0 ? candles5m[candles5m.length - 1] : undefined;
+
+    const filterChecks: FilterChecks = {
+      htfEmaPass: false,
+      adxPass: false,
+      volumeSurgePass: false,
+      rmsWindowPass: false,
+      dailyLimitPass: false,
+      staleDataPass: candleMgr.isTickFeedFresh(30000),
+      killSwitchPass: !(await isKillSwitchActive()),
+    };
 
     // 1. RMS Check
     const rmsResult = await RMSService.evaluateRMS(symbol);
+    filterChecks.rmsWindowPass = !rmsResult.reason?.includes('OUTSIDE_MOMENTUM_WINDOW');
+    filterChecks.dailyLimitPass = !rmsResult.reason?.includes('DAILY_LIMIT_EXCEEDED');
+
     if (!rmsResult.allowed) {
       console.warn(`[Webhook] Signal Rejected by RMS: ${rmsResult.reason}`);
       await SignalModel.create({
+        signalId,
         symbol,
         action,
-        price,
-        rmsPassed: false,
+        direction,
+        spotPrice: price,
+        timestamp: now,
+        timestampIST,
+        timestampEpoch,
+        selectedStrike: strike,
+        candleData: latestCandle,
+        filterChecks,
+        status: 'REJECTED',
         rejectionReason: rmsResult.reason,
+        rmsPassed: false,
+        indicatorsPassed: false,
+        filtersPassed: false,
+        mlApproved: false,
         rawPayload: payload,
       });
 
       res.status(422).json({
         status: 'REJECTED',
+        signalId,
         stage: 'RMS',
         reason: rmsResult.reason,
       });
@@ -47,28 +86,46 @@ export class WebhookController {
     }
 
     // 2. Fetch Candle Buffers & Evaluate GainzAlgo V2 Alpha Engine
-    const candleMgr = getCandleManager(symbol);
-    const candles5m = candleMgr.get5mCandles();
-    const candles15m = candleMgr.get15mCandles();
-
     const indicatorEval = GainzAlgoEngine.evaluate(candles5m);
+    const indicatorData = {
+      ema9: indicatorEval.fastEma,
+      ema21: indicatorEval.slowEma,
+      rsi14: indicatorEval.rsi,
+      adx14: 0,
+      atr14: indicatorEval.atr,
+      volumeSma20: 0,
+    };
 
-    // If indicator evaluation didn't trigger, log and reject
+    // If indicator evaluation didn't trigger, log telemetry and reject
     if (indicatorEval.action !== action && process.env.BYPASS_INDICATOR_CHECK !== 'true') {
       const reason = `INDICATOR_MISMATCH: GainzAlgo engine calculated action (${indicatorEval.action}) vs signal action (${action})`;
       console.warn(`[Webhook] ${reason}`);
+
       await SignalModel.create({
+        signalId,
         symbol,
         action,
-        price,
+        direction,
+        spotPrice: price,
+        timestamp: now,
+        timestampIST,
+        timestampEpoch,
+        selectedStrike: strike,
+        candleData: latestCandle,
+        indicators: indicatorData,
+        filterChecks,
+        status: 'REJECTED',
+        rejectionReason: reason,
         rmsPassed: true,
         indicatorsPassed: false,
-        rejectionReason: reason,
+        filtersPassed: false,
+        mlApproved: false,
         rawPayload: payload,
       });
 
       res.status(422).json({
         status: 'REJECTED',
+        signalId,
         stage: 'INDICATORS',
         reason,
         indicators: indicatorEval,
@@ -85,21 +142,40 @@ export class WebhookController {
       candles15m
     );
 
+    filterChecks.htfEmaPass = !filterEval.rejectionReason?.includes('HTF_BIAS');
+    filterChecks.adxPass = filterEval.adxValue >= 20;
+    filterChecks.volumeSurgePass = filterEval.volumeRatio >= 1.3;
+
+    indicatorData.adx14 = filterEval.adxValue;
+    indicatorData.volumeSma20 = filterEval.volumeRatio;
+
     if (!filterEval.passed) {
       console.warn(`[Webhook] Signal Rejected by Filters: ${filterEval.rejectionReason}`);
       await SignalModel.create({
+        signalId,
         symbol,
         action,
-        price,
+        direction,
+        spotPrice: price,
+        timestamp: now,
+        timestampIST,
+        timestampEpoch,
+        selectedStrike: strike,
+        candleData: latestCandle,
+        indicators: indicatorData,
+        filterChecks,
+        status: 'REJECTED',
+        rejectionReason: filterEval.rejectionReason,
         rmsPassed: true,
         indicatorsPassed: true,
         filtersPassed: false,
-        rejectionReason: filterEval.rejectionReason,
+        mlApproved: false,
         rawPayload: payload,
       });
 
       res.status(422).json({
         status: 'REJECTED',
+        signalId,
         stage: 'FILTERS',
         reason: filterEval.rejectionReason,
         filterData: filterEval,
@@ -128,21 +204,33 @@ export class WebhookController {
       console.warn(`[Webhook] ${reason}`);
 
       await SignalModel.create({
+        signalId,
         symbol,
         action,
-        price,
+        direction,
+        spotPrice: price,
+        timestamp: now,
+        timestampIST,
+        timestampEpoch,
+        selectedStrike: strike,
+        candleData: latestCandle,
+        indicators: indicatorData,
+        filterChecks,
+        status: 'REJECTED',
+        rejectionReason: reason,
+        mlScore: mlResponse.probability,
         rmsPassed: true,
         indicatorsPassed: true,
         filtersPassed: true,
         mlApproved: false,
         mlProbability: mlResponse.probability,
-        rejectionReason: reason,
         rawPayload: payload,
         features: featureVector,
       });
 
       res.status(422).json({
         status: 'REJECTED',
+        signalId,
         stage: 'ML_GATEKEEPER',
         reason,
         probability: mlResponse.probability,
@@ -156,24 +244,38 @@ export class WebhookController {
       const reason = 'DAILY_LIMIT_EXCEEDED: Another trade acquired atomic lock for today';
       console.warn(`[Webhook] ${reason}`);
 
+      filterChecks.dailyLimitPass = false;
+
       await SignalModel.create({
+        signalId,
         symbol,
         action,
-        price,
-        rmsPassed: false,
+        direction,
+        spotPrice: price,
+        timestamp: now,
+        timestampIST,
+        timestampEpoch,
+        selectedStrike: strike,
+        candleData: latestCandle,
+        indicators: indicatorData,
+        filterChecks,
+        status: 'REJECTED',
         rejectionReason: reason,
+        mlScore: mlResponse.probability,
+        rmsPassed: false,
         rawPayload: payload,
       });
 
       res.status(429).json({
         status: 'REJECTED',
+        signalId,
         stage: 'ATOMIC_LOCK',
         reason,
       });
       return;
     }
 
-    // 7. All Checks Passed -> Execute Paper Trade
+    // 7. All Checks Passed -> Execute Paper Trade with Execution Realism & State Machine
     const tradeId = `TRADE_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const atr = indicatorEval.atr > 0 ? indicatorEval.atr : price * 0.01;
 
@@ -190,28 +292,29 @@ export class WebhookController {
 
     const tradeDateIST = getTodayISTDateString();
     const token = payload.symbol || 'NIFTY_ATM';
+    const quantity = 50; // Standard 1-lot Nifty option quantity
+    const slippagePercent = 0.002; // 0.2% slippage on option premium
 
-    const paperTrade = await PaperTradeModel.create({
-      tradeId,
-      symbol,
-      token,
-      action,
-      entryPrice: price,
-      targetPrice,
-      stopLossPrice,
-      entryTimestamp: new Date(),
-      status: 'OPEN',
-      exitReason: 'NONE',
-      mlProbability: mlResponse.probability,
-      tradeDateIST,
-      features: featureVector,
-    });
+    const grossEntryPrice = price;
+    const netEntryPrice = action === 'BUY' ? grossEntryPrice * (1 + slippagePercent) : grossEntryPrice * (1 - slippagePercent);
 
-    // Save successful signal log
+    // Save Executed Signal Telemetry
     await SignalModel.create({
+      signalId,
       symbol,
       action,
-      price,
+      direction,
+      spotPrice: price,
+      timestamp: now,
+      timestampIST,
+      timestampEpoch,
+      selectedStrike: strike,
+      candleData: latestCandle,
+      indicators: indicatorData,
+      filterChecks,
+      status: 'EXECUTED',
+      rejectionReason: null,
+      mlScore: mlResponse.probability,
       rmsPassed: true,
       indicatorsPassed: true,
       filtersPassed: true,
@@ -221,28 +324,65 @@ export class WebhookController {
       features: featureVector,
     });
 
+    // Create PaperTrade with strict lifecycle state machine
+    await PaperTradeModel.create({
+      tradeId,
+      symbol,
+      token,
+      action,
+      direction,
+      selectedStrike: strike,
+      quantity,
+      state: 'POSITION_OPEN',
+      status: 'OPEN',
+      stateTimestamps: {
+        signalDetectedAt: now,
+        riskApprovedAt: now,
+        orderPlacedAt: now,
+        positionOpenedAt: now,
+      },
+      entryPrice: netEntryPrice,
+      grossEntryPrice,
+      netEntryPrice,
+      targetPrice,
+      stopLossPrice,
+      entryTimestamp: now,
+      exitReason: 'NONE',
+      slippagePercent,
+      mlProbability: mlResponse.probability,
+      tradeDateIST,
+      features: featureVector,
+    });
+
     // Register active paper trade in RAM worker
     TrackerWorker.registerPosition({
       tradeId,
       symbol,
       token,
       action,
-      entryPrice: price,
+      entryPrice: netEntryPrice,
+      grossEntryPrice,
       targetPrice,
       stopLossPrice,
-      entryTimestamp: Date.now(),
+      entryTimestamp: now.getTime(),
       maxHoldTimeMinutes: 35,
       featureVector,
+      quantity,
+      selectedStrike: strike,
     });
 
-    console.log(`[Webhook] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId}`);
+    console.log(`[Webhook] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId} | Strike: ${strike}`);
 
     res.status(201).json({
       status: 'EXECUTED',
+      signalId,
       tradeId,
       symbol,
       action,
-      entryPrice: price,
+      direction,
+      selectedStrike: strike,
+      grossEntryPrice,
+      netEntryPrice,
       targetPrice,
       stopLossPrice,
       mlProbability: mlResponse.probability,
