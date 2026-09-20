@@ -1,0 +1,98 @@
+version: '3.8'
+
+services:
+  core-api:
+    build:
+      context: ./services/core-api
+      dockerfile: Dockerfile
+    container_name: tradegatekeeper-core-api
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongodb:27017/tradegatekeeper
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ML_SERVICE_URL=http://ml-service:8000
+      - SMARTAPI_API_KEY=${SMARTAPI_API_KEY}
+      - SMARTAPI_CLIENT_CODE=${SMARTAPI_CLIENT_CODE}
+      - SMARTAPI_PIN=${SMARTAPI_PIN}
+      - SMARTAPI_TOTP_SECRET=${SMARTAPI_TOTP_SECRET}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ml-service:
+        condition: service_healthy
+    networks:
+      - tradegatekeeper-net
+
+  ml-service:
+    build:
+      context: ./services/ml-service
+      dockerfile: Dockerfile
+    container_name: tradegatekeeper-ml-service
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/tradegatekeeper
+      - MODEL_PATH=model.xgb
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - tradegatekeeper-net
+
+  mongodb:
+    image: mongo:7.0
+    container_name: tradegatekeeper-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - tradegatekeeper-net
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: tradegatekeeper-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - tradegatekeeper-net
+
+networks:
+  tradegatekeeper-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local
+  redis-data:
+    driver: local
