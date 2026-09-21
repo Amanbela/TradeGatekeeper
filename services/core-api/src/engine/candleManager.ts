@@ -38,6 +38,20 @@ export class CandleManager {
   }
 
   /**
+   * Helper method to process ticks using token and price directly
+   */
+  public onTickReceived(token: string, price: number, volume: number = 1): { closed5m?: OHLCV; closed15m?: OHLCV } {
+    const symbol = token === '26000' ? 'NIFTY' : token;
+    return this.processTick({
+      symbol,
+      token,
+      price,
+      volume,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
    * Process a live tick and update / close 5m and 15m candles
    */
   public processTick(tick: TickData): { closed5m?: OHLCV; closed15m?: OHLCV } {
