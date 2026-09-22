@@ -1,4 +1,6 @@
+import moment from 'moment-timezone';
 import { TickData, OHLCV } from '../types';
+import { InternalSignalDispatcher } from './internalSignalDispatcher';
 
 export class CandleManager {
   private symbol: string;
@@ -52,7 +54,58 @@ export class CandleManager {
   }
 
   /**
-   * Process a live tick and update / close 5m and 15m candles
+   * Static helper to load historical 5M candles into a symbol's CandleManager
+   */
+  public static loadHistoricalCandles(symbol: string, candles5m: OHLCV[]): void {
+    getCandleManager(symbol).loadHistoricalCandles(candles5m);
+  }
+
+  /**
+   * Inject historical 5-minute candles and derive/pre-populate 15-minute candles automatically
+   */
+  public loadHistoricalCandles(candles5m: OHLCV[]): void {
+    this.candles5m = [...candles5m].sort((a, b) => a.timestamp - b.timestamp);
+
+    const interval15m = 15 * 60 * 1000;
+    const map15m = new Map<number, OHLCV>();
+
+    for (const c of this.candles5m) {
+      const start15m = Math.floor(c.timestamp / interval15m) * interval15m;
+      if (!map15m.has(start15m)) {
+        map15m.set(start15m, {
+          timestamp: start15m,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume || 0,
+        });
+      } else {
+        const existing = map15m.get(start15m)!;
+        existing.high = Math.max(existing.high, c.high);
+        existing.low = Math.min(existing.low, c.low);
+        existing.close = c.close;
+        existing.volume += c.volume || 0;
+      }
+    }
+
+    this.candles15m = Array.from(map15m.values()).sort((a, b) => a.timestamp - b.timestamp);
+
+    if (this.candles5m.length > 0) {
+      const last5m = this.candles5m[this.candles5m.length - 1];
+      this.current5mStart = Math.floor(last5m.timestamp / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    }
+    if (this.candles15m.length > 0) {
+      const last15m = this.candles15m[this.candles15m.length - 1];
+      this.current15mStart = Math.floor(last15m.timestamp / (15 * 60 * 1000)) * (15 * 60 * 1000);
+    }
+
+    console.log(`[CandleManager] Injected ${this.candles5m.length} 5M candles & derived ${this.candles15m.length} 15M candles for ${this.symbol}.`);
+  }
+
+  /**
+   * Process a live tick, update in-memory candle state, detect candle close,
+   * and automatically trigger internal GainzAlgo indicator evaluation pipeline.
    */
   public processTick(tick: TickData): { closed5m?: OHLCV; closed15m?: OHLCV } {
     const timestamp = tick.timestamp || Date.now();
@@ -75,6 +128,16 @@ export class CandleManager {
       if (this.current5mCandle && this.current5mCandle.close !== undefined) {
         closed5m = this.current5mCandle as OHLCV;
         this.add5mCandle(closed5m);
+
+        const timeIST = moment(closed5m.timestamp).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss [IST]');
+        console.log(
+          `[CandleManager] 5M Candle Closed for ${this.symbol}: O=${closed5m.open} H=${closed5m.high} L=${closed5m.low} C=${closed5m.close} V=${closed5m.volume} at ${timeIST}`
+        );
+
+        // Immediately trigger internal GainzAlgo signal evaluation pipeline
+        InternalSignalDispatcher.evaluateOnCandleClose(this.symbol, closed5m).catch((err) => {
+          console.error(`[CandleManager] Error evaluating signal on 5M candle close for ${this.symbol}:`, err);
+        });
       }
       this.current5mStart = candle5mStart;
       this.current5mCandle = {
@@ -119,7 +182,7 @@ export class CandleManager {
 
   public add5mCandle(candle: OHLCV): void {
     this.candles5m.push(candle);
-    if (this.candles5m.length > 200) {
+    if (this.candles5m.length > 300) {
       this.candles5m.shift();
     }
   }

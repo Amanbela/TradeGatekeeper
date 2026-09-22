@@ -6,6 +6,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { connectDB } from './config/db';
 import { loginSmartApi } from './config/smartApi';
+import { bootstrapHistoricalCandles } from './services/historyBootstrap';
 import { TrackerWorker } from './services/trackerWorker';
 import apiRouter from './routes/api';
 
@@ -31,13 +32,16 @@ async function bootstrap() {
     // 2. Authenticate SmartAPI Session & Generate TOTP
     await loginSmartApi();
 
-    // 3. Initialize Paper Trade Tracker & RAM positions state
+    // 3. Warmup Historical OHLCV Candles from Angel One SmartAPI REST
+    await bootstrapHistoricalCandles('NIFTY', '26000');
+
+    // 4. Initialize Paper Trade Tracker & RAM positions state
     await TrackerWorker.init();
 
-    // 4. Connect Live WebSocket market feed
+    // 5. Connect Live WebSocket market feed
     TrackerWorker.connectSmartApiWebSocket();
 
-    // 5. Listen Express API Server
+    // 6. Listen Express API Server
     const server = app.listen(PORT, () => {
       console.log(`[Core API] Server running on http://0.0.0.0:${PORT}`);
       console.log(`[Core API] Endpoints available at http://0.0.0.0:${PORT}/api/v1/health`);
