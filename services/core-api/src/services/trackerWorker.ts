@@ -28,47 +28,41 @@ export class TrackerWorker {
     quantity: number = 50,
     slippagePercent: number = 0.002
   ): FinancialFrictions {
+    // Delta proxy for index to option conversion (0.5 for ATM)
+    const OPTION_DELTA = 0.5;
+
+    // Spot point slippage should be ~1 to 2 spot points (which equals ~0.5 to 1.0 option pt)
+    const spotSlippagePoints = 1.5;
+
     let netEntryPrice: number;
     let netExitPrice: number;
 
     if (action === 'BUY') {
-      // Buying option: buy slightly higher due to ask spread
-      netEntryPrice = grossEntryPrice * (1 + slippagePercent);
-      // Exiting (selling option): sell slightly lower due to bid spread
-      netExitPrice = grossExitPrice * (1 - slippagePercent);
+      netEntryPrice = +(grossEntryPrice + spotSlippagePoints).toFixed(2);
+      netExitPrice = +(grossExitPrice - spotSlippagePoints).toFixed(2);
     } else {
-      // Selling option: sell slightly lower
-      netEntryPrice = grossEntryPrice * (1 - slippagePercent);
-      // Exiting (buying back option): buy slightly higher
-      netExitPrice = grossExitPrice * (1 + slippagePercent);
+      netEntryPrice = +(grossEntryPrice - spotSlippagePoints).toFixed(2);
+      netExitPrice = +(grossExitPrice + spotSlippagePoints).toFixed(2);
     }
 
-    const buyTurnover = (action === 'BUY' ? netEntryPrice : netExitPrice) * quantity;
-    const sellTurnover = (action === 'BUY' ? netExitPrice : netEntryPrice) * quantity;
-    const totalTurnover = buyTurnover + sellTurnover;
+    const estimatedPremium = Math.max(80, grossEntryPrice * 0.005);
+    const optionLegTurnover = estimatedPremium * quantity; // e.g., 120 * 50 = ₹6,000
+    const totalOptionTurnover = optionLegTurnover * 2;     // Round trip = ₹12,000
 
-    // ₹20 flat brokerage per order (₹40 round trip)
-    const brokerage = 40.0;
+    const brokerage = 40.0; // ₹20 flat per order (round trip ₹40)
+    const sttTax = +(optionLegTurnover * 0.001).toFixed(2); // 0.1% on sell turnover (~₹6)
+    const stampDuty = +(optionLegTurnover * 0.00003).toFixed(2); // 0.003% on buy turnover (~₹0.18)
+    const exchangeCharges = +(totalOptionTurnover * 0.0005).toFixed(2); // 0.05% of turnover (~₹6)
+    const gst = +((brokerage + exchangeCharges) * 0.18).toFixed(2); // 18% on brokerage + exchange
+    const totalTaxesAndCharges = +(brokerage + sttTax + stampDuty + exchangeCharges + gst).toFixed(2); // ~₹60
 
-    // STT/CTT: 0.1% on option sell turnover
-    const sttTax = sellTurnover * 0.001;
+    const grossSpotPoints = action === 'BUY' ? grossExitPrice - grossEntryPrice : grossEntryPrice - grossExitPrice;
+    const netSpotPoints = action === 'BUY' ? netExitPrice - netEntryPrice : netEntryPrice - netExitPrice;
 
-    // Stamp Duty: 0.003% on option buy turnover
-    const stampDuty = buyTurnover * 0.00003;
-
-    // Exchange turnover charges: ~0.05% of turnover
-    const exchangeCharges = totalTurnover * 0.0005;
-
-    // GST: 18% on (brokerage + exchange charges)
-    const gst = (brokerage + exchangeCharges) * 0.18;
-
-    const totalTaxesAndCharges = brokerage + sttTax + stampDuty + exchangeCharges + gst;
-
-    const grossPnLPoints = action === 'BUY' ? grossExitPrice - grossEntryPrice : grossEntryPrice - grossExitPrice;
-    const grossPnLAmount = grossPnLPoints * quantity;
-
-    const netPnLPoints = action === 'BUY' ? netExitPrice - netEntryPrice : netEntryPrice - netExitPrice;
-    const netRealizedPnL = netPnLPoints * quantity - totalTaxesAndCharges;
+    // Option points gained/lost = spot points * delta (0.5)
+    const grossPnLAmount = +(grossSpotPoints * OPTION_DELTA * quantity).toFixed(2);
+    const netPnLPoints = +(netSpotPoints * OPTION_DELTA).toFixed(2);
+    const netRealizedPnL = +(netPnLPoints * quantity - totalTaxesAndCharges).toFixed(2);
 
     return {
       slippagePercent,
@@ -77,7 +71,7 @@ export class TrackerWorker {
       grossExitPrice,
       netExitPrice,
       quantity,
-      grossPnLPoints,
+      grossPnLPoints: +grossSpotPoints.toFixed(2),
       grossPnLAmount,
       brokerage,
       sttTax,
