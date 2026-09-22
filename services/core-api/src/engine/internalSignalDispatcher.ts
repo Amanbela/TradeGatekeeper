@@ -214,18 +214,28 @@ export class InternalSignalDispatcher {
 
     // 7. All Checks Passed -> Execute Paper Trade
     const tradeId = `TRADE_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    const atr = indicatorEval.atr > 0 ? indicatorEval.atr : price * 0.01;
+
+    // Clamped ATR for realistic intraday Nifty targets (~30 to 52 pts TP1, ~18 to 35 pts SL)
+    const rawAtr = indicatorEval.atr > 0 ? indicatorEval.atr : 25;
+    const effectiveAtr = Math.max(18, Math.min(rawAtr, 35));
+
+    const targetPoints = Math.round(effectiveAtr * 1.5);   // ~27 to 52 spot points
+    const stopLossPoints = Math.round(effectiveAtr * 1.0); // ~18 to 35 spot points
 
     let targetPrice: number;
     let stopLossPrice: number;
 
     if (action === 'BUY') {
-      targetPrice = price + atr * 1.5;
-      stopLossPrice = price - atr * 1.0;
+      targetPrice = +(price + targetPoints).toFixed(2);
+      stopLossPrice = +(price - stopLossPoints).toFixed(2);
     } else {
-      targetPrice = price - atr * 1.5;
-      stopLossPrice = price + atr * 1.0;
+      targetPrice = +(price - targetPoints).toFixed(2);
+      stopLossPrice = +(price + stopLossPoints).toFixed(2);
     }
+
+    console.log(
+      `[InternalSignalDispatcher] Dynamic Targets Set: Spot=${price} | ATR=${effectiveAtr.toFixed(1)} | TargetOffset=${targetPoints} pts (TP: ${targetPrice}) | SLOffset=${stopLossPoints} pts (SL: ${stopLossPrice})`
+    );
 
     const tradeDateIST = getTodayISTDateString();
     const token = '26000'; // Nifty 50 Spot Token
