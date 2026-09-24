@@ -20,9 +20,19 @@ export function generateTOTP(secret: string): string {
   }
 }
 
-export async function loginSmartApi(): Promise<SmartApiSession> {
-  // Return cached session if still valid (valid for 12 hours)
-  if (cachedSession && Date.now() - lastLoginTime < 12 * 60 * 60 * 1000) {
+export function invalidateSmartApiSession(): void {
+  cachedSession = null;
+  lastLoginTime = 0;
+  console.log('[SmartAPI] In-memory session invalidated.');
+}
+
+export async function loginSmartApi(forceRefresh: boolean = false): Promise<SmartApiSession> {
+  if (forceRefresh) {
+    invalidateSmartApiSession();
+  }
+
+  // Return cached session if still valid (valid for 12 hours) and forceRefresh is false
+  if (!forceRefresh && cachedSession && Date.now() - lastLoginTime < 12 * 60 * 60 * 1000) {
     return cachedSession;
   }
 

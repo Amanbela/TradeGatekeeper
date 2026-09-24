@@ -38,8 +38,8 @@ async function bootstrap() {
     // 4. Initialize Paper Trade Tracker & RAM positions state
     await TrackerWorker.init();
 
-    // 5. Connect Live WebSocket market feed
-    TrackerWorker.connectSmartApiWebSocket();
+    // 5. Initialize Market Hours Cron Lifecycle Scheduler & Live Market Feed
+    TrackerWorker.initMarketLifecycleScheduler();
 
     // 6. Listen Express API Server
     const server = app.listen(PORT, () => {
@@ -50,6 +50,7 @@ async function bootstrap() {
     // Graceful Shutdown
     const gracefulShutdown = (signal: string) => {
       console.log(`\n[Core API] Received ${signal}. Shutting down gracefully...`);
+      TrackerWorker.stopMarketSession();
       server.close(() => {
         console.log('[Core API] Express HTTP server closed.');
         process.exit(0);

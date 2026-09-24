@@ -1,8 +1,9 @@
 import WebSocket from 'ws';
+import moment from 'moment-timezone';
 import { ActivePosition, FinancialFrictions, TickData, TradeAction } from '../types';
 import { PaperTradeModel } from '../models/PaperTrade';
 import { setLastExitTimestamp } from '../config/redis';
-import { getCachedSession, loginSmartApi } from '../config/smartApi';
+import { getCachedSession, invalidateSmartApiSession, loginSmartApi } from '../config/smartApi';
 import { getCandleManager } from '../engine/candleManager';
 
 export class TrackerWorker {
@@ -17,6 +18,17 @@ export class TrackerWorker {
   private static readonly maxReconnectDelayMs = 30000;
   private static readonly baseReconnectDelayMs = 1000;
   private static isConnecting = false;
+
+  // 401 Interceptor & Self-Healing Exponential Backoff state
+  private static authFailureAttempts = 0;
+  private static readonly maxAuthFailureAttempts = 5;
+  private static isHandling401 = false;
+
+  // Working-Days Market Session Lifecycle state (Asia/Kolkata timezone)
+  private static isMarketSessionActive = false;
+  private static lifecycleCheckTimer: NodeJS.Timeout | null = null;
+  private static lastWarmupDate = '';
+  private static lastShutdownDate = '';
 
   /**
    * Helper to compute realistic option trading frictions (slippage, STT, brokerage, exchange charges, GST)
@@ -359,9 +371,65 @@ export class TrackerWorker {
   }
 
   /**
+   * Self-healing 401 Unauthorized Interceptor with exponential backoff & max 5 retry threshold
+   */
+  private static async handle401Error(): Promise<void> {
+    if (this.isHandling401) {
+      return;
+    }
+    this.isHandling401 = true;
+    this.isConnecting = false;
+    this.cleanupSocketState();
+
+    if (this.authFailureAttempts >= this.maxAuthFailureAttempts) {
+      console.error(
+        `[TrackerWorker] Max auth retry attempts (${this.maxAuthFailureAttempts}) reached due to persistent 401 Unauthorized errors. Halting auto-reconnect.`
+      );
+      this.isHandling401 = false;
+      return;
+    }
+
+    this.authFailureAttempts++;
+    console.log('[TrackerWorker] SmartAPI 401 Unauthorized detected. Invalidation and refreshing session credentials...');
+
+    invalidateSmartApiSession();
+
+    const delay = Math.min(
+      this.baseReconnectDelayMs * Math.pow(2, this.authFailureAttempts - 1),
+      this.maxReconnectDelayMs
+    );
+
+    console.warn(
+      `[TrackerWorker] Scheduling 401 self-healing reconnect in ${(delay / 1000).toFixed(1)}s (Attempt #${this.authFailureAttempts}/${this.maxAuthFailureAttempts})...`
+    );
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        await loginSmartApi(true);
+        this.isHandling401 = false;
+        await this.connectSmartApiWebSocket();
+      } catch (err: any) {
+        console.error('[TrackerWorker] Error during 401 self-healing reconnect:', err.message);
+        this.isHandling401 = false;
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  /**
    * Schedule auto-reconnect with exponential backoff
    */
   private static scheduleReconnect(): void {
+    if (!this.isMarketSessionActive && !this.isMarketHours()) {
+      console.log('[TrackerWorker] Market session is inactive. WebSocket reconnect skipped.');
+      return;
+    }
+
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -409,6 +477,11 @@ export class TrackerWorker {
    * Connects to Angel One SmartAPI SmartStream v2 WebSocket for live market stream
    */
   public static async connectSmartApiWebSocket(): Promise<void> {
+    if (!this.isMarketSessionActive && !this.isMarketHours()) {
+      console.log('[TrackerWorker] Skipping WebSocket connection: outside active market hours.');
+      return;
+    }
+
     if (this.isConnecting) {
       console.log('[TrackerWorker] WebSocket connection attempt already in progress.');
       return;
@@ -455,9 +528,18 @@ export class TrackerWorker {
         },
       });
 
+      this.wsClient.on('unexpected-response', (_req, res) => {
+        console.error(`[TrackerWorker] WebSocket unexpected server response: ${res.statusCode} ${res.statusMessage}`);
+        if (res.statusCode === 401) {
+          this.handle401Error();
+        }
+      });
+
       this.wsClient.on('open', () => {
         this.isConnecting = false;
         this.reconnectAttempts = 0;
+        this.authFailureAttempts = 0;
+        this.isHandling401 = false;
         console.log('[TrackerWorker] Connected to SmartAPI WebSocket stream.');
 
         // Transmit immediate Mode-1 (LTP) subscription payload for Nifty 50 Spot (exchangeType: 1, token: "26000")
@@ -538,6 +620,14 @@ export class TrackerWorker {
           clearInterval(this.pingInterval);
           this.pingInterval = null;
         }
+
+        if (
+          err.message.includes('401') ||
+          err.message.toLowerCase().includes('unauthorized') ||
+          err.message.includes('Unexpected server response: 401')
+        ) {
+          this.handle401Error();
+        }
       });
 
       this.wsClient.on('close', (code: number, reason: Buffer) => {
@@ -548,7 +638,10 @@ export class TrackerWorker {
           clearInterval(this.pingInterval);
           this.pingInterval = null;
         }
-        TrackerWorker.scheduleReconnect();
+
+        if (!this.isHandling401 && (this.isMarketSessionActive || this.isMarketHours())) {
+          TrackerWorker.scheduleReconnect();
+        }
       });
     } catch (e: any) {
       this.isConnecting = false;
@@ -556,7 +649,130 @@ export class TrackerWorker {
       if (e.stack) {
         console.error('[TrackerWorker] Exception stack trace:', e.stack);
       }
-      TrackerWorker.scheduleReconnect();
+      if (
+        e.message?.includes('401') ||
+        e.message?.toLowerCase().includes('unauthorized')
+      ) {
+        this.handle401Error();
+      } else if (this.isMarketSessionActive || this.isMarketHours()) {
+        TrackerWorker.scheduleReconnect();
+      }
+    }
+  }
+
+  /**
+   * Helper to check if current IST time falls within active trading hours (Monday-Friday, 08:45 AM - 03:45 PM IST)
+   */
+  public static isMarketHours(): boolean {
+    const now = moment().tz('Asia/Kolkata');
+    const day = now.day(); // 0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat
+    if (day === 0 || day === 6) return false;
+
+    const totalMinutes = now.hours() * 60 + now.minutes();
+    const startMinutes = 8 * 60 + 45; // 08:45 AM = 525 minutes
+    const endMinutes = 15 * 60 + 45;  // 03:45 PM = 945 minutes
+
+    return totalMinutes >= startMinutes && totalMinutes < endMinutes;
+  }
+
+  /**
+   * 08:45 AM IST Pre-Market Warmup Procedure
+   */
+  public static async startPreMarketWarmup(): Promise<void> {
+    console.log('[TrackerWorker] Starting pre-market warmup (08:45 AM IST)...');
+    this.isMarketSessionActive = true;
+    this.authFailureAttempts = 0;
+    this.reconnectAttempts = 0;
+
+    try {
+      await loginSmartApi(true);
+      await this.connectSmartApiWebSocket();
+      console.log('[TrackerWorker] Pre-market warmup complete. WebSocket ready for 09:15 AM market open.');
+    } catch (err: any) {
+      console.error('[TrackerWorker] Error during pre-market warmup:', err.message);
+    }
+  }
+
+  /**
+   * 03:45 PM IST Post-Market Shutdown Procedure
+   */
+  public static stopMarketSession(): void {
+    console.log('[TrackerWorker] Initiating post-market shutdown (03:45 PM IST)...');
+    this.isMarketSessionActive = false;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+
+    if (this.wsClient) {
+      try {
+        this.wsClient.removeAllListeners();
+        if (
+          this.wsClient.readyState === WebSocket.OPEN ||
+          this.wsClient.readyState === WebSocket.CONNECTING
+        ) {
+          this.wsClient.close(1000, 'Normal Closure');
+        }
+      } catch (err: any) {
+        console.error('[TrackerWorker] Error during WebSocket closure:', err.message);
+      }
+      this.wsClient = null;
+    }
+
+    console.log('[TrackerWorker] Market session closed. WebSocket safely disconnected for overnight idle.');
+  }
+
+  /**
+   * Initializes the IST Market Hours Lifecycle Scheduler
+   */
+  public static initMarketLifecycleScheduler(): void {
+    console.log('[TrackerWorker] Initializing IST Market Hours Lifecycle Scheduler (Asia/Kolkata timezone)...');
+
+    if (this.lifecycleCheckTimer) {
+      clearInterval(this.lifecycleCheckTimer);
+    }
+
+    // Evaluate IST market schedule state every 15 seconds
+    this.lifecycleCheckTimer = setInterval(async () => {
+      const now = moment().tz('Asia/Kolkata');
+      const day = now.day(); // 0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat
+      const dateStr = now.format('YYYY-MM-DD');
+
+      if (day >= 1 && day <= 5) {
+        const totalMinutes = now.hours() * 60 + now.minutes();
+        const warmupTime = 8 * 60 + 45;   // 08:45 AM = 525 mins
+        const shutdownTime = 15 * 60 + 45; // 03:45 PM = 945 mins
+
+        // Trigger 08:45 AM Pre-market warmup
+        if (totalMinutes >= warmupTime && totalMinutes < shutdownTime) {
+          if (this.lastWarmupDate !== dateStr) {
+            this.lastWarmupDate = dateStr;
+            await this.startPreMarketWarmup();
+          }
+        }
+
+        // Trigger 03:45 PM Post-market shutdown
+        if (totalMinutes >= shutdownTime && this.lastShutdownDate !== dateStr) {
+          this.lastShutdownDate = dateStr;
+          this.stopMarketSession();
+        }
+      }
+    }, 15000);
+
+    // Initial check on application boot
+    if (this.isMarketHours()) {
+      const todayStr = moment().tz('Asia/Kolkata').format('YYYY-MM-DD');
+      this.lastWarmupDate = todayStr;
+      console.log('[TrackerWorker] Application launched during market hours. Starting pre-market warmup...');
+      this.startPreMarketWarmup();
+    } else {
+      console.log('[TrackerWorker] Application launched outside market hours. WebSocket remaining idle until next session warmup (08:45 AM IST).');
+      this.isMarketSessionActive = false;
     }
   }
 }
