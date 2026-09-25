@@ -83,10 +83,13 @@ export async function bootstrapHistoricalCandles(
   const fromDate = moment().tz('Asia/Kolkata').subtract(5, 'days').format('YYYY-MM-DD 09:15');
 
   try {
+    // Nifty 50 Spot uses 26000 on WebSocket, but 99926000 on SmartAPI Historical REST API
+    const restToken = (token === '26000' || symbol.toUpperCase() === 'NIFTY') ? '99926000' : token;
+
     const url = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
     const requestBody = {
       exchange: 'NSE',
-      symboltoken: token,
+      symboltoken: restToken,
       interval: 'FIVE_MINUTE',
       fromdate: fromDate,
       todate: toDate,
@@ -132,7 +135,7 @@ export async function bootstrapHistoricalCandles(
       CandleManager.loadHistoricalCandles(symbol, parsedCandles);
       return parsedCandles;
     } else {
-      console.warn('[HistoryBootstrap] SmartAPI REST returned empty or invalid candle array. Falling back to synthetic candles.');
+      console.warn(`[HistoryBootstrap] SmartAPI REST returned empty candle array. Status: ${response.data?.status}, Message: ${response.data?.message}`);
       const mockCandles = generateMockCandles(symbol, 5);
       CandleManager.loadHistoricalCandles(symbol, mockCandles);
       return mockCandles;
