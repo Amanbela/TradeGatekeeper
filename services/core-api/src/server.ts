@@ -8,6 +8,8 @@ import { connectDB } from './config/db';
 import { loginSmartApi } from './config/smartApi';
 import { bootstrapHistoricalCandles } from './services/historyBootstrap';
 import { TrackerWorker } from './services/trackerWorker';
+import { ReconciliationService } from './services/reconciliationService';
+import { logSystemEvent } from './models/SystemEvent';
 import apiRouter from './routes/api';
 
 const app = express();
@@ -29,6 +31,12 @@ async function bootstrap() {
     // 1. Connect MongoDB
     await connectDB();
 
+    await logSystemEvent('APPLICATION_RESTARTED', 'TradeGatekeeper Core API Bootstrapping', 'INFO', {
+      nodeEnv: process.env.NODE_ENV,
+      port: PORT,
+      mlMode: process.env.ML_MODE || 'advisory',
+    });
+
     // 2. Authenticate SmartAPI Session & Generate TOTP
     await loginSmartApi();
 
@@ -38,10 +46,13 @@ async function bootstrap() {
     // 4. Initialize Paper Trade Tracker & RAM positions state
     await TrackerWorker.init();
 
-    // 5. Initialize Market Hours Cron Lifecycle Scheduler & Live Market Feed
+    // 5. Initialize Periodic Position Drift Reconciliation Service
+    ReconciliationService.startPeriodicReconciliation(60000);
+
+    // 6. Initialize Market Hours Cron Lifecycle Scheduler & Live Market Feed
     TrackerWorker.initMarketLifecycleScheduler();
 
-    // 6. Listen Express API Server
+    // 7. Listen Express API Server
     const server = app.listen(PORT, () => {
       console.log(`[Core API] Server running on http://0.0.0.0:${PORT}`);
       console.log(`[Core API] Endpoints available at http://0.0.0.0:${PORT}/api/v1/health`);
@@ -50,6 +61,7 @@ async function bootstrap() {
     // Graceful Shutdown
     const gracefulShutdown = (signal: string) => {
       console.log(`\n[Core API] Received ${signal}. Shutting down gracefully...`);
+      ReconciliationService.stop();
       TrackerWorker.stopMarketSession();
       server.close(() => {
         console.log('[Core API] Express HTTP server closed.');
@@ -59,10 +71,12 @@ async function bootstrap() {
 
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-  } catch (error) {
+  } catch (error: any) {
     console.error('[Core API] Bootstrap error:', error);
+    logSystemEvent('MONGO_UNAVAILABLE', `Core API Bootstrap error: ${error.message}`, 'CRITICAL').catch(() => {});
     process.exit(1);
   }
 }
 
 bootstrap();
+

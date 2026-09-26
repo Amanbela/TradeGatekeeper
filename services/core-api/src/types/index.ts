@@ -18,6 +18,8 @@ export interface TickData {
   price: number;
   volume: number;
   timestamp: number;
+  bid?: number;
+  ask?: number;
 }
 
 export interface OHLCV {
@@ -27,6 +29,7 @@ export interface OHLCV {
   low: number;
   close: number;
   volume: number;
+  isIncomplete?: boolean;
 }
 
 export interface SignalPayload {
@@ -39,6 +42,8 @@ export interface SignalPayload {
   strikePrice?: number;
   optionType?: 'CE' | 'PE';
   selectedStrike?: string;
+  idempotencyKey?: string;
+  correlationId?: string;
 }
 
 export interface IndicatorResult {
@@ -64,6 +69,7 @@ export interface FilterChecks {
   dailyLimitPass: boolean;
   staleDataPass: boolean;
   killSwitchPass: boolean;
+  mlPass?: boolean;
 }
 
 export interface MlFeatureVector {
@@ -84,6 +90,7 @@ export interface MlPredictResponse {
   approved: boolean;
   threshold: number;
   modelLoaded: boolean;
+  mode?: string;
 }
 
 export interface RMSCheckResult {
@@ -93,6 +100,8 @@ export interface RMSCheckResult {
 
 export interface ActivePosition {
   tradeId: string;
+  correlationId: string;
+  idempotencyKey?: string;
   symbol: string;
   token: string;
   action: TradeAction;
@@ -105,6 +114,10 @@ export interface ActivePosition {
   featureVector: MlFeatureVector;
   quantity: number;
   selectedStrike: string;
+  optionToken?: string;
+  optionBid?: number;
+  optionAsk?: number;
+  simulatedFillPrice?: number;
 }
 
 export interface FinancialFrictions {
@@ -122,4 +135,7 @@ export interface FinancialFrictions {
   stampDuty: number;
   totalTaxesAndCharges: number;
   netRealizedPnL: number;
+  actualOptionPnL?: number;
+  syntheticDeltaPnL?: number;
 }
+

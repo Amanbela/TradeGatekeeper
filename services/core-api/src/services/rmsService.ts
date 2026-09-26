@@ -2,6 +2,8 @@ import moment from 'moment-timezone';
 import { RMSCheckResult } from '../types';
 import { isDailyTradeLocked, isKillSwitchActive } from '../config/redis';
 import { getCandleManager } from '../engine/candleManager';
+import { SystemStateModel } from '../models/SystemState';
+import { PaperTradeModel } from '../models/PaperTrade';
 
 export class RMSService {
   // Pre-configured RBI Policy & Key Event dates (YYYY-MM-DD in IST)
@@ -87,6 +89,50 @@ export class RMSService {
       }
     }
 
+    // Rule 4: Maximum Daily Loss Check
+    const maxDailyLossEnv = process.env.MAX_DAILY_LOSS;
+    if (maxDailyLossEnv) {
+      const maxDailyLoss = parseFloat(maxDailyLossEnv);
+      const stateDoc = await SystemStateModel.findOne({ key: 'GLOBAL_STATE' });
+      if (stateDoc) {
+        const totalDailyLoss = (stateDoc.dailyRealizedLoss || 0) + (stateDoc.dailyUnrealizedLoss || 0);
+        if (totalDailyLoss >= maxDailyLoss) {
+          return {
+            allowed: false,
+            reason: `MAX_DAILY_LOSS_EXCEEDED: Current daily loss ₹${totalDailyLoss.toFixed(2)} >= max limit ₹${maxDailyLoss}`,
+          };
+        }
+      }
+    }
+
+    // Rule 5: Consecutive Loss Limit Check
+    const maxConsecutiveLossesEnv = process.env.MAX_CONSECUTIVE_LOSSES;
+    if (maxConsecutiveLossesEnv) {
+      const maxConsecutiveLosses = parseInt(maxConsecutiveLossesEnv, 10);
+      const stateDoc = await SystemStateModel.findOne({ key: 'GLOBAL_STATE' });
+      if (stateDoc && stateDoc.consecutiveLosses >= maxConsecutiveLosses) {
+        return {
+          allowed: false,
+          reason: `MAX_CONSECUTIVE_LOSSES_REACHED: Consecutive losses (${stateDoc.consecutiveLosses}) reached limit (${maxConsecutiveLosses})`,
+        };
+      }
+    }
+
+    // Rule 6: Capital Exposure Limit Check
+    const maxCapitalExposureEnv = process.env.MAX_CAPITAL_EXPOSURE;
+    if (maxCapitalExposureEnv) {
+      const maxExposure = parseFloat(maxCapitalExposureEnv);
+      const openTrades = await PaperTradeModel.find({ status: 'OPEN' });
+      const currentExposure = openTrades.reduce((acc, t) => acc + (t.netEntryPrice * t.quantity), 0);
+      if (currentExposure >= maxExposure) {
+        return {
+          allowed: false,
+          reason: `CAPITAL_EXPOSURE_LIMIT_EXCEEDED: Open exposure ₹${currentExposure.toFixed(2)} >= max limit ₹${maxExposure}`,
+        };
+      }
+    }
+
     return { allowed: true };
   }
 }
+

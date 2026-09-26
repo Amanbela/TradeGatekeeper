@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import moment from 'moment-timezone';
 import { OHLCV, FilterChecks, MlFeatureVector } from '../types';
 import { RMSService } from '../services/rmsService';
@@ -19,6 +20,7 @@ export class InternalSignalDispatcher {
    */
   public static async evaluateOnCandleClose(symbol: string, closed5m: OHLCV): Promise<void> {
     const signalId = uuidv4();
+    const correlationId = uuidv4();
     const now = new Date();
     const timestampEpoch = closed5m.timestamp || now.getTime();
     const timestampIST = moment(timestampEpoch).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss [IST]');
@@ -40,7 +42,19 @@ export class InternalSignalDispatcher {
     const direction = action === 'BUY' ? 'CALL' : 'PUT';
     const strike = `${symbol} ${Math.round(price / 50) * 50} ${direction === 'CALL' ? 'CE' : 'PE'}`;
 
-    console.log(`[InternalSignalDispatcher] 5M Candle Close Signal Triggered: ${action} (${direction}) ${symbol} @ ${price} [Signal ID: ${signalId}]`);
+    // Signal Idempotency Key Generation
+    const candleTimestamp = Math.floor(timestampEpoch / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    const rawIdempotencyString = `${symbol}:${candleTimestamp}:${direction}:${action}:5m_candle_close`;
+    const idempotencyKey = crypto.createHash('sha256').update(rawIdempotencyString).digest('hex');
+
+    // Atomic idempotency check in MongoDB
+    const existingSignal = await SignalModel.findOne({ idempotencyKey });
+    if (existingSignal) {
+      console.warn(`[InternalSignalDispatcher] Duplicate signal skipped! IdempotencyKey: ${idempotencyKey}`);
+      return;
+    }
+
+    console.log(`[InternalSignalDispatcher] 5M Candle Close Signal Triggered: ${action} (${direction}) ${symbol} @ ${price} [Signal ID: ${signalId} | Correlation: ${correlationId}]`);
 
     const filterChecks: FilterChecks = {
       htfEmaPass: false,
@@ -50,9 +64,10 @@ export class InternalSignalDispatcher {
       dailyLimitPass: false,
       staleDataPass: candleMgr.isTickFeedFresh(30000),
       killSwitchPass: !(await isKillSwitchActive()),
+      mlPass: false,
     };
 
-    // 2. RMS Check (Momentum Window, Blacklist Dates, Daily Limit)
+    // 2. RMS Check (Momentum Window, Blacklist Dates, Daily Limit, Loss Limits)
     const rmsResult = await RMSService.evaluateRMS(symbol);
     filterChecks.rmsWindowPass = !rmsResult.reason?.includes('OUTSIDE_MOMENTUM_WINDOW');
     filterChecks.dailyLimitPass = !rmsResult.reason?.includes('DAILY_LIMIT_EXCEEDED');
@@ -61,6 +76,8 @@ export class InternalSignalDispatcher {
       console.warn(`[InternalSignalDispatcher] Signal Rejected by RMS: ${rmsResult.reason}`);
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -91,8 +108,9 @@ export class InternalSignalDispatcher {
       candles15m
     );
 
+    const adxThreshold = parseFloat(process.env.ADX_ENTRY_THRESHOLD || '20.0');
     filterChecks.htfEmaPass = !filterEval.rejectionReason?.includes('HTF_BIAS');
-    filterChecks.adxPass = filterEval.adxValue >= 20;
+    filterChecks.adxPass = filterEval.adxValue >= adxThreshold;
     filterChecks.volumeSurgePass = filterEval.volumeRatio >= 1.3;
 
     const indicatorData = {
@@ -108,6 +126,8 @@ export class InternalSignalDispatcher {
       console.warn(`[InternalSignalDispatcher] Signal Rejected by Filters: ${filterEval.rejectionReason}`);
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -130,7 +150,7 @@ export class InternalSignalDispatcher {
       return;
     }
 
-    // 4. Construct Feature Vector for Python ML Gatekeeper
+    // 4. Construct Feature Vector for Python ML Subsystem
     const atrNormalized = indicatorEval.atr > 0 ? (indicatorEval.atr / price) * 100 : 1.5;
     const oiBuildupScore = 0.5;
 
@@ -143,16 +163,18 @@ export class InternalSignalDispatcher {
       oiBuildupScore,
     };
 
-    // 5. Query Python ML Subsystem (Required Threshold: P >= 0.60)
+    // 5. Query Python ML Subsystem
     const mlResponse = await MlClient.predict(featureVector);
-    const minThreshold = parseFloat(process.env.ML_PROBABILITY_THRESHOLD || '0.60');
+    filterChecks.mlPass = mlResponse.approved;
 
-    if (!mlResponse.approved || mlResponse.probability < minThreshold) {
-      const reason = `ML_DISAPPROVED: Win probability P(Win)=${(mlResponse.probability * 100).toFixed(1)}% is below required ${(minThreshold * 100).toFixed(1)}% threshold`;
+    if (!mlResponse.approved) {
+      const reason = `ML_DISAPPROVED: Win probability P(Win)=${(mlResponse.probability * 100).toFixed(1)}% is below threshold`;
       console.warn(`[InternalSignalDispatcher] ${reason}`);
 
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -167,6 +189,7 @@ export class InternalSignalDispatcher {
         status: 'REJECTED',
         rejectionReason: reason,
         mlScore: mlResponse.probability,
+        mlMode: mlResponse.mode,
         rmsPassed: true,
         indicatorsPassed: true,
         filtersPassed: true,
@@ -187,6 +210,8 @@ export class InternalSignalDispatcher {
 
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -201,6 +226,7 @@ export class InternalSignalDispatcher {
         status: 'REJECTED',
         rejectionReason: reason,
         mlScore: mlResponse.probability,
+        mlMode: mlResponse.mode,
         rmsPassed: false,
         indicatorsPassed: true,
         filtersPassed: true,
@@ -215,12 +241,11 @@ export class InternalSignalDispatcher {
     // 7. All Checks Passed -> Execute Paper Trade
     const tradeId = `TRADE_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
-    // Clamped ATR for realistic intraday Nifty targets (~30 to 52 pts TP1, ~18 to 35 pts SL)
     const rawAtr = indicatorEval.atr > 0 ? indicatorEval.atr : 25;
     const effectiveAtr = Math.max(18, Math.min(rawAtr, 35));
 
-    const targetPoints = Math.round(effectiveAtr * 1.5);   // ~27 to 52 spot points
-    const stopLossPoints = Math.round(effectiveAtr * 1.0); // ~18 to 35 spot points
+    const targetPoints = Math.round(effectiveAtr * 1.5);
+    const stopLossPoints = Math.round(effectiveAtr * 1.0);
 
     let targetPrice: number;
     let stopLossPrice: number;
@@ -239,7 +264,7 @@ export class InternalSignalDispatcher {
 
     const tradeDateIST = getTodayISTDateString();
     const token = '26000'; // Nifty 50 Spot Token
-    const quantity = 50; // Standard 1-lot Nifty option quantity
+    const quantity = parseInt(process.env.NIFTY_LOT_SIZE || '50', 10);
     const slippagePercent = 0.002; // 0.2% slippage on option premium
 
     const grossEntryPrice = price;
@@ -248,6 +273,8 @@ export class InternalSignalDispatcher {
     // Save Executed Signal Telemetry to MongoDB
     await SignalModel.create({
       signalId,
+      correlationId,
+      idempotencyKey,
       symbol,
       action,
       direction,
@@ -262,6 +289,7 @@ export class InternalSignalDispatcher {
       status: 'EXECUTED',
       rejectionReason: null,
       mlScore: mlResponse.probability,
+      mlMode: mlResponse.mode,
       rmsPassed: true,
       indicatorsPassed: true,
       filtersPassed: true,
@@ -274,6 +302,8 @@ export class InternalSignalDispatcher {
     // Create PaperTrade with strict lifecycle state machine
     await PaperTradeModel.create({
       tradeId,
+      correlationId,
+      idempotencyKey,
       symbol,
       token,
       action,
@@ -297,6 +327,7 @@ export class InternalSignalDispatcher {
       exitReason: 'NONE',
       slippagePercent,
       mlProbability: mlResponse.probability,
+      mlMode: mlResponse.mode,
       tradeDateIST,
       features: featureVector,
     });
@@ -304,6 +335,8 @@ export class InternalSignalDispatcher {
     // Register active paper trade in RAM worker
     TrackerWorker.registerPosition({
       tradeId,
+      correlationId,
+      idempotencyKey,
       symbol,
       token,
       action,
@@ -318,6 +351,6 @@ export class InternalSignalDispatcher {
       selectedStrike: strike,
     });
 
-    console.log(`[InternalSignalDispatcher] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId} | Strike: ${strike} | Entry: ${netEntryPrice.toFixed(2)}`);
+    console.log(`[InternalSignalDispatcher] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId} | Correlation: ${correlationId} | Strike: ${strike} | Entry: ${netEntryPrice.toFixed(2)}`);
   }
 }

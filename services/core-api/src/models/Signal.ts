@@ -3,6 +3,8 @@ import { OHLCV, OptionDirection, TradeAction } from '../types';
 
 export interface ISignal extends Document {
   signalId: string;
+  correlationId: string;
+  idempotencyKey: string;
   symbol: string;
   action: TradeAction;
   direction: OptionDirection;
@@ -28,10 +30,12 @@ export interface ISignal extends Document {
     dailyLimitPass: boolean;
     staleDataPass: boolean;
     killSwitchPass: boolean;
+    mlPass?: boolean;
   };
   status: 'EXECUTED' | 'REJECTED';
   rejectionReason?: string;
   mlScore?: number;
+  mlMode?: string;
   rmsPassed: boolean;
   indicatorsPassed: boolean;
   filtersPassed: boolean;
@@ -51,6 +55,8 @@ export interface ISignal extends Document {
 const SignalSchema: Schema = new Schema(
   {
     signalId: { type: String, required: true, unique: true, index: true },
+    correlationId: { type: String, required: true, index: true },
+    idempotencyKey: { type: String, required: true, unique: true, index: true },
     symbol: { type: String, required: true, index: true },
     action: { type: String, required: true, enum: ['BUY', 'SELL'] },
     direction: { type: String, required: true, enum: ['CALL', 'PUT'] },
@@ -83,10 +89,12 @@ const SignalSchema: Schema = new Schema(
       dailyLimitPass: { type: Boolean, default: false },
       staleDataPass: { type: Boolean, default: true },
       killSwitchPass: { type: Boolean, default: true },
+      mlPass: { type: Boolean, default: false },
     },
     status: { type: String, required: true, enum: ['EXECUTED', 'REJECTED'], index: true },
     rejectionReason: { type: String },
     mlScore: { type: Number },
+    mlMode: { type: String, default: 'advisory' },
     rmsPassed: { type: Boolean, default: false },
     indicatorsPassed: { type: Boolean, default: false },
     filtersPassed: { type: Boolean, default: false },
@@ -108,3 +116,4 @@ const SignalSchema: Schema = new Schema(
 );
 
 export const SignalModel = mongoose.model<ISignal>('Signal', SignalSchema);
+

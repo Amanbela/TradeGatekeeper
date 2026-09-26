@@ -3,12 +3,22 @@ import { OptionDirection, TradeAction, TradeState } from '../types';
 
 export interface IPaperTrade extends Document {
   tradeId: string;
+  correlationId: string;
+  idempotencyKey?: string;
   symbol: string;
   token: string;
   action: TradeAction;
   direction: OptionDirection;
   selectedStrike: string;
   quantity: number;
+
+  // Real option market data
+  optionToken?: string;
+  optionLtp?: number;
+  optionBid?: number;
+  optionAsk?: number;
+  optionSpread?: number;
+  simulatedFillPrice?: number;
 
   // Lifecycle state machine
   state: TradeState;
@@ -50,7 +60,12 @@ export interface IPaperTrade extends Document {
   pnlPoints?: number; // net PnL points
   netRealizedPnL?: number;
 
+  // Comparative Dual PnL Tracking
+  actualOptionPnL?: number;
+  syntheticDeltaPnL?: number;
+
   mlProbability: number;
+  mlMode?: string;
   tradeDateIST: string; // YYYY-MM-DD
   features: {
     volumeRatio20: number;
@@ -65,12 +80,22 @@ export interface IPaperTrade extends Document {
 const PaperTradeSchema: Schema = new Schema(
   {
     tradeId: { type: String, required: true, unique: true, index: true },
+    correlationId: { type: String, required: true, index: true },
+    idempotencyKey: { type: String, index: true },
     symbol: { type: String, required: true, index: true },
     token: { type: String, required: true },
     action: { type: String, required: true, enum: ['BUY', 'SELL'] },
     direction: { type: String, required: true, enum: ['CALL', 'PUT'], default: 'CALL' },
     selectedStrike: { type: String, required: true, default: 'ATM' },
     quantity: { type: Number, required: true, default: 50 },
+
+    // Real option data
+    optionToken: { type: String },
+    optionLtp: { type: Number },
+    optionBid: { type: Number },
+    optionAsk: { type: Number },
+    optionSpread: { type: Number },
+    simulatedFillPrice: { type: Number },
 
     // State machine
     state: {
@@ -129,7 +154,11 @@ const PaperTradeSchema: Schema = new Schema(
     pnlPoints: { type: Number },
     netRealizedPnL: { type: Number },
 
+    actualOptionPnL: { type: Number },
+    syntheticDeltaPnL: { type: Number },
+
     mlProbability: { type: Number, required: true },
+    mlMode: { type: String, default: 'advisory' },
     tradeDateIST: { type: String, required: true, index: true },
     features: {
       volumeRatio20: { type: Number, required: true },
@@ -146,3 +175,4 @@ const PaperTradeSchema: Schema = new Schema(
 );
 
 export const PaperTradeModel = mongoose.model<IPaperTrade>('PaperTrade', PaperTradeSchema);
+

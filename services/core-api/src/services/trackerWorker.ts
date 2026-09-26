@@ -2,7 +2,9 @@ import WebSocket from 'ws';
 import moment from 'moment-timezone';
 import { ActivePosition, FinancialFrictions, TickData, TradeAction } from '../types';
 import { PaperTradeModel } from '../models/PaperTrade';
-import { setLastExitTimestamp } from '../config/redis';
+import { SystemStateModel } from '../models/SystemState';
+import { logSystemEvent } from '../models/SystemEvent';
+import { setLastExitTimestamp, getTodayISTDateString } from '../config/redis';
 import { getCachedSession, invalidateSmartApiSession, loginSmartApi } from '../config/smartApi';
 import { getCandleManager } from '../engine/candleManager';
 
@@ -32,18 +34,23 @@ export class TrackerWorker {
 
   /**
    * Helper to compute realistic option trading frictions (slippage, STT, brokerage, exchange charges, GST)
+   * and calculate dual PnL metrics (actual option PnL vs synthetic delta PnL).
    */
   public static calculateFrictions(
     action: TradeAction,
     grossEntryPrice: number,
     grossExitPrice: number,
     quantity: number = 50,
-    slippagePercent: number = 0.002
+    slippagePercent: number = 0.002,
+    optionBid?: number,
+    optionAsk?: number,
+    actualOptionEntry?: number,
+    actualOptionExit?: number
   ): FinancialFrictions {
     // Delta proxy for index to option conversion (0.5 for ATM)
     const OPTION_DELTA = 0.5;
 
-    // Spot point slippage should be ~1 to 2 spot points (which equals ~0.5 to 1.0 option pt)
+    // Spot point slippage should be ~1.5 spot points (~0.75 option pt)
     const spotSlippagePoints = 1.5;
 
     let netEntryPrice: number;
@@ -72,9 +79,17 @@ export class TrackerWorker {
     const netSpotPoints = action === 'BUY' ? netExitPrice - netEntryPrice : netEntryPrice - netExitPrice;
 
     // Option points gained/lost = spot points * delta (0.5)
+    const syntheticDeltaPnL = +(netSpotPoints * OPTION_DELTA * quantity - totalTaxesAndCharges).toFixed(2);
+
+    let actualOptionPnL: number | undefined;
+    if (actualOptionEntry !== undefined && actualOptionExit !== undefined) {
+      const optionPointsGained = action === 'BUY' ? actualOptionExit - actualOptionEntry : actualOptionEntry - actualOptionExit;
+      actualOptionPnL = +(optionPointsGained * quantity - totalTaxesAndCharges).toFixed(2);
+    }
+
     const grossPnLAmount = +(grossSpotPoints * OPTION_DELTA * quantity).toFixed(2);
     const netPnLPoints = +(netSpotPoints * OPTION_DELTA).toFixed(2);
-    const netRealizedPnL = +(netPnLPoints * quantity - totalTaxesAndCharges).toFixed(2);
+    const netRealizedPnL = actualOptionPnL !== undefined ? actualOptionPnL : syntheticDeltaPnL;
 
     return {
       slippagePercent,
@@ -91,22 +106,26 @@ export class TrackerWorker {
       stampDuty,
       totalTaxesAndCharges,
       netRealizedPnL,
+      actualOptionPnL,
+      syntheticDeltaPnL,
     };
   }
 
   /**
-   * Initialize TrackerWorker and restore OPEN paper trades from MongoDB with exact elapsed durations
+   * Initialize TrackerWorker and restore OPEN paper trades from MongoDB with exact state recovery
    */
   public static async init(): Promise<void> {
     console.log('[TrackerWorker] Initializing active trades tracker & state machine recovery...');
     try {
       const openTrades = await PaperTradeModel.find({
-        $or: [{ status: 'OPEN' }, { state: { $in: ['POSITION_OPEN', 'ORDER_PLACED'] } }],
+        $or: [{ status: 'OPEN' }, { state: { $in: ['POSITION_OPEN', 'ORDER_PLACED', 'RISK_APPROVED'] } }],
       });
 
       for (const trade of openTrades) {
         this.registerPosition({
           tradeId: trade.tradeId,
+          correlationId: trade.correlationId || trade.tradeId,
+          idempotencyKey: trade.idempotencyKey,
           symbol: trade.symbol,
           token: trade.token,
           action: trade.action,
@@ -119,9 +138,15 @@ export class TrackerWorker {
           featureVector: trade.features,
           quantity: trade.quantity || 50,
           selectedStrike: trade.selectedStrike || 'ATM',
+          optionToken: trade.optionToken,
+          optionBid: trade.optionBid,
+          optionAsk: trade.optionAsk,
+          simulatedFillPrice: trade.simulatedFillPrice,
         });
       }
-      console.log(`[TrackerWorker] Restored ${openTrades.length} OPEN position(s) into RAM state machine.`);
+      console.log(`[TrackerWorker] Restored ${openTrades.length} OPEN position(s) from MongoDB into RAM state machine.`);
+
+      logSystemEvent('RECOVERY_PERFORMED', `Startup recovery restored ${openTrades.length} OPEN positions into RAM`, 'INFO').catch(() => {});
 
       // Start periodic 35-minute Theta Decay Time-Stop checker (runs every 15 seconds)
       if (!this.checkIntervalTimer) {
@@ -129,8 +154,9 @@ export class TrackerWorker {
           this.checkTimeStops();
         }, 15000);
       }
-    } catch (err) {
-      console.error('[TrackerWorker] Error initializing tracker:', err);
+    } catch (err: any) {
+      console.error('[TrackerWorker] Error initializing tracker:', err.message);
+      logSystemEvent('MONGO_UNAVAILABLE', `TrackerWorker init failed: ${err.message}`, 'CRITICAL').catch(() => {});
     }
   }
 
@@ -140,7 +166,7 @@ export class TrackerWorker {
   public static registerPosition(position: ActivePosition): void {
     this.activePositions.set(position.tradeId, position);
     console.log(
-      `[TrackerWorker] Position Active [${position.selectedStrike}]: ${position.action} ${position.symbol} @ Gross: ${position.grossEntryPrice} (Net: ${position.entryPrice.toFixed(2)}) | TP1: ${position.targetPrice.toFixed(2)} | SL: ${position.stopLossPrice.toFixed(2)}`
+      `[TrackerWorker] Position Active [${position.selectedStrike}] (Correlation: ${position.correlationId}): ${position.action} ${position.symbol} @ Gross: ${position.grossEntryPrice} (Net: ${position.entryPrice.toFixed(2)}) | TP1: ${position.targetPrice.toFixed(2)} | SL: ${position.stopLossPrice.toFixed(2)}`
     );
   }
 
@@ -159,23 +185,23 @@ export class TrackerWorker {
         if (pos.action === 'BUY') {
           // Target 1 Hit
           if (currentPrice >= pos.targetPrice) {
-            await this.closePosition(tradeId, currentPrice, 'TARGET_HIT', 1);
+            await this.closePosition(tradeId, currentPrice, 'TARGET_HIT', 1, tick.bid, tick.ask);
             continue;
           }
           // Stop Loss Hit
           if (currentPrice <= pos.stopLossPrice) {
-            await this.closePosition(tradeId, currentPrice, 'SL_HIT', 0);
+            await this.closePosition(tradeId, currentPrice, 'SL_HIT', 0, tick.bid, tick.ask);
             continue;
           }
         } else if (pos.action === 'SELL') {
           // Target 1 Hit
           if (currentPrice <= pos.targetPrice) {
-            await this.closePosition(tradeId, currentPrice, 'TARGET_HIT', 1);
+            await this.closePosition(tradeId, currentPrice, 'TARGET_HIT', 1, tick.bid, tick.ask);
             continue;
           }
           // Stop Loss Hit
           if (currentPrice >= pos.stopLossPrice) {
-            await this.closePosition(tradeId, currentPrice, 'SL_HIT', 0);
+            await this.closePosition(tradeId, currentPrice, 'SL_HIT', 0, tick.bid, tick.ask);
             continue;
           }
         }
@@ -207,7 +233,9 @@ export class TrackerWorker {
     tradeId: string,
     grossExitPrice: number,
     reason: 'TARGET_HIT' | 'SL_HIT' | 'TIME_EXIT' | 'FORCE_EXIT',
-    outcomeLabel: number
+    outcomeLabel: number,
+    optionBid?: number,
+    optionAsk?: number
   ): Promise<void> {
     const pos = this.activePositions.get(tradeId);
     if (!pos) return;
@@ -216,11 +244,14 @@ export class TrackerWorker {
       pos.action,
       pos.grossEntryPrice,
       grossExitPrice,
-      pos.quantity
+      pos.quantity,
+      0.002,
+      optionBid,
+      optionAsk
     );
 
     console.log(
-      `[TrackerWorker] Closing Trade ${tradeId} [${reason}] | Gross Exit: ${grossExitPrice} (Net Exit: ${frictions.netExitPrice.toFixed(2)}) | Net PnL: ₹${frictions.netRealizedPnL.toFixed(2)} (Charges: ₹${frictions.totalTaxesAndCharges.toFixed(2)})`
+      `[TrackerWorker] Closing Trade ${tradeId} [${reason}] (Correlation: ${pos.correlationId}) | Gross Exit: ${grossExitPrice} (Net Exit: ${frictions.netExitPrice.toFixed(2)}) | Net PnL: ₹${frictions.netRealizedPnL.toFixed(2)} (Charges: ₹${frictions.totalTaxesAndCharges.toFixed(2)})`
     );
 
     try {
@@ -244,15 +275,36 @@ export class TrackerWorker {
           stampDuty: frictions.stampDuty,
           totalTaxesAndCharges: frictions.totalTaxesAndCharges,
           netRealizedPnL: frictions.netRealizedPnL,
+          actualOptionPnL: frictions.actualOptionPnL,
+          syntheticDeltaPnL: frictions.syntheticDeltaPnL,
           'stateTimestamps.exitTriggeredAt': new Date(),
           'stateTimestamps.positionClosedAt': new Date(),
         }
       );
 
+      // Update SystemState statistics (consecutive losses & daily realized loss)
+      const stateDoc = await SystemStateModel.findOne({ key: 'GLOBAL_STATE' });
+      if (stateDoc) {
+        const isLoss = outcomeLabel === 0 || frictions.netRealizedPnL < 0;
+        const newConsecutiveLosses = isLoss ? (stateDoc.consecutiveLosses || 0) + 1 : 0;
+        const lossAmount = frictions.netRealizedPnL < 0 ? Math.abs(frictions.netRealizedPnL) : 0;
+        const newDailyLoss = (stateDoc.dailyRealizedLoss || 0) + lossAmount;
+
+        await SystemStateModel.updateOne(
+          { key: 'GLOBAL_STATE' },
+          {
+            $set: {
+              consecutiveLosses: newConsecutiveLosses,
+              dailyRealizedLoss: newDailyLoss,
+            },
+          }
+        );
+      }
+
       // Set anti-whipsaw cooldown in Redis (30 mins lockout)
       await setLastExitTimestamp(pos.symbol, Date.now());
-    } catch (err) {
-      console.error(`[TrackerWorker] Error saving closed trade ${tradeId} to MongoDB:`, err);
+    } catch (err: any) {
+      console.error(`[TrackerWorker] Error saving closed trade ${tradeId} to MongoDB:`, err.message);
     } finally {
       this.activePositions.delete(tradeId);
     }
@@ -261,6 +313,7 @@ export class TrackerWorker {
   public static getActivePositions(): ActivePosition[] {
     return Array.from(this.activePositions.values());
   }
+
 
   /**
    * Helper to unpack SmartStream v2 binary buffer for Mode-1 (LTP)
@@ -613,6 +666,7 @@ export class TrackerWorker {
 
       this.wsClient.on('error', (err: Error) => {
         console.error('[TrackerWorker] WebSocket error:', err.message);
+        getCandleManager('NIFTY').setConnectionInterrupted(true);
         if (err.stack) {
           console.error('[TrackerWorker] Stack trace:', err.stack);
         }
@@ -634,6 +688,7 @@ export class TrackerWorker {
         this.isConnecting = false;
         const reasonStr = reason ? reason.toString() : '';
         console.warn(`[TrackerWorker] WebSocket closed. Code: ${code}, Reason: "${reasonStr}".`);
+        getCandleManager('NIFTY').setConnectionInterrupted(true);
         if (this.pingInterval) {
           clearInterval(this.pingInterval);
           this.pingInterval = null;

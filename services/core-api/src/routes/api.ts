@@ -6,6 +6,8 @@ import { TrackerWorker } from '../services/trackerWorker';
 import { getCandleManager } from '../engine/candleManager';
 import { MlClient } from '../services/mlClient';
 import { setKillSwitchState, isKillSwitchActive } from '../config/redis';
+import { requireAdminAuth } from '../middleware/authMiddleware';
+import { logAuditRecord } from '../models/AuditLog';
 import { TickData } from '../types';
 
 const router = Router();
@@ -36,15 +38,23 @@ router.post('/tick', async (req: Request, res: Response) => {
   res.status(200).json({ status: 'TICK_PROCESSED', symbol: tickData.symbol, price: tickData.price });
 });
 
-// Toggle emergency manual kill switch
-router.post('/kill-switch', async (req: Request, res: Response) => {
-  const { active } = req.body;
+// Toggle emergency manual kill switch (PROTECTED - REQUIRES ADMIN AUTH)
+router.post('/kill-switch', requireAdminAuth, async (req: Request, res: Response) => {
+  const { active, reason } = req.body;
   if (typeof active !== 'boolean') {
     res.status(400).json({ error: 'INVALID_PAYLOAD', message: 'Boolean field "active" is required.' });
     return;
   }
 
-  await setKillSwitchState(active);
+  const toggleReason = reason || 'MANUAL_ADMIN_TOGGLE';
+  await setKillSwitchState(active, toggleReason);
+  await logAuditRecord(
+    active ? 'KILL_SWITCH_ACTIVATED' : 'KILL_SWITCH_DEACTIVATED',
+    { active, reason: toggleReason },
+    'ADMIN_API',
+    req.ip
+  );
+
   res.json({
     status: 'SUCCESS',
     killSwitchActive: active,
@@ -52,8 +62,8 @@ router.post('/kill-switch', async (req: Request, res: Response) => {
   });
 });
 
-// Get emergency manual kill switch & data feed health status
-router.get('/kill-switch', async (req: Request, res: Response) => {
+// Get emergency manual kill switch & data feed health status (PROTECTED - REQUIRES ADMIN AUTH)
+router.get('/kill-switch', requireAdminAuth, async (req: Request, res: Response) => {
   const active = await isKillSwitchActive();
   const candleMgr = getCandleManager('NIFTY');
   const isFresh = candleMgr.isTickFeedFresh(30000);
@@ -106,9 +116,10 @@ router.get('/signals', async (req: Request, res: Response) => {
   }
 });
 
-// Trigger ML Model Retraining
-router.post('/ml/train', async (req: Request, res: Response) => {
+// Trigger ML Model Retraining (PROTECTED - REQUIRES ADMIN AUTH)
+router.post('/ml/train', requireAdminAuth, async (req: Request, res: Response) => {
   try {
+    await logAuditRecord('ML_TRAINING_TRIGGERED', {}, 'ADMIN_API', req.ip);
     const result = await MlClient.triggerRetraining();
     res.json(result);
   } catch (err: any) {
@@ -132,3 +143,4 @@ router.get('/health', async (req: Request, res: Response) => {
 });
 
 export default router;
+

@@ -14,7 +14,7 @@ export interface GainzAlgoOutput {
 export class GainzAlgoEngine {
   /**
    * Calculates Fast EMA(9), Slow EMA(21), RSI(14), and ATR(14) with 1.5x multiplier.
-   * Checks if an EMA crossover/crossunder occurred within the last 4 bars
+   * Checks if an EMA crossover/crossunder occurred within the configured max age bars (default 4 bars)
    * AND RSI crosses the 55 (BUY) / 45 (SELL) threshold.
    */
   public static evaluate(candles: OHLCV[]): GainzAlgoOutput {
@@ -31,6 +31,8 @@ export class GainzAlgoEngine {
     if (!candles || candles.length < 30) {
       return defaultOutput;
     }
+
+    const maxAgeBars = parseInt(process.env.SIGNAL_MAX_AGE_BARS || '4', 10);
 
     const closes = candles.map((c) => c.close);
     const highs = candles.map((c) => c.high);
@@ -57,14 +59,14 @@ export class GainzAlgoEngine {
     const prevRsi = rsiArray[rsiArray.length - 2];
     const latestAtr = atrArray[atrArray.length - 1] * 1.5; // ATR with 1.5 multiplier
 
-    // Check EMA Crossover/Crossunder within the last 4 bars (bar offset 0, 1, 2, 3)
-    let bullishEmaCrossInLast4 = false;
-    let bearishEmaCrossInLast4 = false;
+    // Check EMA Crossover/Crossunder within maxAgeBars (offset 0 to maxAgeBars - 1)
+    let bullishEmaCrossInWindow = false;
+    let bearishEmaCrossInWindow = false;
 
     const fastLen = fastEmaArray.length;
     const slowLen = slowEmaArray.length;
 
-    for (let offset = 0; offset < 4; offset++) {
+    for (let offset = 0; offset < maxAgeBars; offset++) {
       const idxFastCurr = fastLen - 1 - offset;
       const idxFastPrev = idxFastCurr - 1;
       const idxSlowCurr = slowLen - 1 - offset;
@@ -77,10 +79,10 @@ export class GainzAlgoEngine {
         const slowPrev = slowEmaArray[idxSlowPrev];
 
         if (fastPrev <= slowPrev && fastCurr > slowCurr) {
-          bullishEmaCrossInLast4 = true;
+          bullishEmaCrossInWindow = true;
         }
         if (fastPrev >= slowPrev && fastCurr < slowCurr) {
-          bearishEmaCrossInLast4 = true;
+          bearishEmaCrossInWindow = true;
         }
       }
     }
@@ -93,11 +95,11 @@ export class GainzAlgoEngine {
     let emaCrossInLast4 = false;
     let rsiTriggered = false;
 
-    if (bullishEmaCrossInLast4 && (bullishRsiCross || latestRsi > 55)) {
+    if (bullishEmaCrossInWindow && (bullishRsiCross || latestRsi > 55)) {
       action = 'BUY';
       emaCrossInLast4 = true;
       rsiTriggered = true;
-    } else if (bearishEmaCrossInLast4 && (bearishRsiCross || latestRsi < 45)) {
+    } else if (bearishEmaCrossInWindow && (bearishRsiCross || latestRsi < 45)) {
       action = 'SELL';
       emaCrossInLast4 = true;
       rsiTriggered = true;
@@ -114,3 +116,4 @@ export class GainzAlgoEngine {
     };
   }
 }
+

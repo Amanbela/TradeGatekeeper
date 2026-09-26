@@ -7,13 +7,14 @@ export interface FilterEvaluationResult {
   rejectionReason?: string;
   htf200Ema: number;
   adxValue: number;
+  adxRising?: boolean;
   volumeRatio: number;
   htfEmaDistance: number;
 }
 
 export class OptionFilters {
   /**
-   * Evaluates higher timeframe trend bias, ADX chop filter, volume surge, and anti-whipsaw cooldown.
+   * Evaluates higher timeframe trend bias, ADX chop/hysteresis filter, volume surge, and anti-whipsaw cooldown.
    */
   public static async evaluateFilters(
     symbol: string,
@@ -26,9 +27,13 @@ export class OptionFilters {
       passed: false,
       htf200Ema: currentPrice,
       adxValue: 0,
+      adxRising: false,
       volumeRatio: 1.0,
       htfEmaDistance: 0,
     };
+
+    const adxEntryThreshold = parseFloat(process.env.ADX_ENTRY_THRESHOLD || '20.0');
+    const requireRisingAdx = process.env.ADX_RISING_REQUIRED === 'true';
 
     // 1. Higher Timeframe (15m) 200 EMA Trend Bias
     let htf200Ema = currentPrice;
@@ -64,22 +69,35 @@ export class OptionFilters {
       return result;
     }
 
-    // 2. Sideways / Chop Filter: ADX(14) >= 20
+    // 2. Sideways / Chop & Hysteresis Filter: ADX(14) >= adxEntryThreshold (and optional ADX rising check)
     let adxValue = 25; // Default assumption if building candles
+    let isAdxRising = true;
+
     if (candles5m && candles5m.length >= 20) {
       const highs = candles5m.map((c) => c.high);
       const lows = candles5m.map((c) => c.low);
       const closes = candles5m.map((c) => c.close);
 
       const adxArray = ADX.calculate({ period: 14, high: highs, low: lows, close: closes });
-      if (adxArray.length > 0) {
+      if (adxArray.length >= 2) {
+        const latestAdx = adxArray[adxArray.length - 1].adx;
+        const prevAdx = adxArray[adxArray.length - 2].adx;
+        adxValue = latestAdx;
+        isAdxRising = latestAdx >= prevAdx;
+      } else if (adxArray.length > 0) {
         adxValue = adxArray[adxArray.length - 1].adx;
       }
     }
     result.adxValue = adxValue;
+    result.adxRising = isAdxRising;
 
-    if (adxValue < 20) {
-      result.rejectionReason = `CHOP_FILTER_TRIGGERED: ADX (${adxValue.toFixed(2)}) < 20 (Sideways Market)`;
+    if (adxValue < adxEntryThreshold) {
+      result.rejectionReason = `CHOP_FILTER_TRIGGERED: ADX (${adxValue.toFixed(2)}) < threshold ${adxEntryThreshold} (Sideways Market)`;
+      return result;
+    }
+
+    if (requireRisingAdx && !isAdxRising) {
+      result.rejectionReason = `ADX_NOT_RISING: Current ADX (${adxValue.toFixed(2)}) is declining`;
       return result;
     }
 
@@ -119,3 +137,4 @@ export class OptionFilters {
     return result;
   }
 }
+

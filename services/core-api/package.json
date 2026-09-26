@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "test": "node dist/test/unitTests.test.js"
   },
   "dependencies": {
     "axios": "^1.7.9",

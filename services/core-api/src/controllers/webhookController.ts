@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import moment from 'moment-timezone';
 import { SignalPayload, MlFeatureVector, FilterChecks, OHLCV } from '../types';
 import { RMSService } from '../services/rmsService';
@@ -25,13 +26,33 @@ export class WebhookController {
     }
 
     const signalId = uuidv4();
+    const correlationId = payload.correlationId || uuidv4();
     const now = new Date();
-    const timestampEpoch = now.getTime();
+    const timestampEpoch = payload.timestamp || now.getTime();
     const timestampIST = moment(now).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss [IST]');
     const direction = action === 'BUY' ? 'CALL' : 'PUT';
     const strike = payload.selectedStrike || `${symbol} ${Math.round(price / 50) * 50} ${direction === 'CALL' ? 'CE' : 'PE'}`;
 
-    console.log(`[Webhook] Ingesting Signal [${signalId}]: ${action} (${direction}) ${symbol} @ ${price}`);
+    // Signal Idempotency Key Generation
+    const candleTimestamp = Math.floor(timestampEpoch / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    const rawIdempotencyString = `${symbol}:${candleTimestamp}:${direction}:${action}:${payload.timeframe || '5m'}`;
+    const idempotencyKey = payload.idempotencyKey || crypto.createHash('sha256').update(rawIdempotencyString).digest('hex');
+
+    // 0. Check Signal Idempotency in MongoDB
+    const existingSignal = await SignalModel.findOne({ idempotencyKey });
+    if (existingSignal) {
+      console.warn(`[Webhook] Duplicate signal detected! IdempotencyKey: ${idempotencyKey}. Signal ID: ${existingSignal.signalId}`);
+      res.status(409).json({
+        status: 'REJECTED',
+        reason: 'DUPLICATE_SIGNAL',
+        message: 'Signal already processed for this candle and direction.',
+        existingSignalId: existingSignal.signalId,
+        idempotencyKey,
+      });
+      return;
+    }
+
+    console.log(`[Webhook] Ingesting Signal [${signalId}] (Correlation: ${correlationId}): ${action} (${direction}) ${symbol} @ ${price}`);
 
     const candleMgr = getCandleManager(symbol);
     const candles5m = candleMgr.get5mCandles();
@@ -46,6 +67,7 @@ export class WebhookController {
       dailyLimitPass: false,
       staleDataPass: candleMgr.isTickFeedFresh(30000),
       killSwitchPass: !(await isKillSwitchActive()),
+      mlPass: false,
     };
 
     // 1. RMS Check
@@ -57,6 +79,8 @@ export class WebhookController {
       console.warn(`[Webhook] Signal Rejected by RMS: ${rmsResult.reason}`);
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -79,6 +103,7 @@ export class WebhookController {
       res.status(422).json({
         status: 'REJECTED',
         signalId,
+        correlationId,
         stage: 'RMS',
         reason: rmsResult.reason,
       });
@@ -103,6 +128,8 @@ export class WebhookController {
 
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -126,6 +153,7 @@ export class WebhookController {
       res.status(422).json({
         status: 'REJECTED',
         signalId,
+        correlationId,
         stage: 'INDICATORS',
         reason,
         indicators: indicatorEval,
@@ -142,8 +170,9 @@ export class WebhookController {
       candles15m
     );
 
+    const adxThreshold = parseFloat(process.env.ADX_ENTRY_THRESHOLD || '20.0');
     filterChecks.htfEmaPass = !filterEval.rejectionReason?.includes('HTF_BIAS');
-    filterChecks.adxPass = filterEval.adxValue >= 20;
+    filterChecks.adxPass = filterEval.adxValue >= adxThreshold;
     filterChecks.volumeSurgePass = filterEval.volumeRatio >= 1.3;
 
     indicatorData.adx14 = filterEval.adxValue;
@@ -153,6 +182,8 @@ export class WebhookController {
       console.warn(`[Webhook] Signal Rejected by Filters: ${filterEval.rejectionReason}`);
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -176,6 +207,7 @@ export class WebhookController {
       res.status(422).json({
         status: 'REJECTED',
         signalId,
+        correlationId,
         stage: 'FILTERS',
         reason: filterEval.rejectionReason,
         filterData: filterEval,
@@ -183,7 +215,7 @@ export class WebhookController {
       return;
     }
 
-    // 4. Construct Feature Vector for ML Gatekeeper
+    // 4. Construct Feature Vector for ML Microservice
     const atrNormalized = indicatorEval.atr > 0 ? (indicatorEval.atr / price) * 100 : 1.5;
     const oiBuildupScore = payload.oiBuildupScore || 0.5;
 
@@ -196,15 +228,18 @@ export class WebhookController {
       oiBuildupScore,
     };
 
-    // 5. Query Python ML Subsystem (P(Win) >= 0.80)
+    // 5. Query ML Subsystem (Respects ML_MODE=advisory vs ML_MODE=gating)
     const mlResponse = await MlClient.predict(featureVector);
+    filterChecks.mlPass = mlResponse.approved;
 
     if (!mlResponse.approved) {
-      const reason = `ML_DISAPPROVED: Win probability P(Win)=${(mlResponse.probability * 100).toFixed(1)}% is below required 80.0% threshold`;
+      const reason = `ML_DISAPPROVED: Win probability P(Win)=${(mlResponse.probability * 100).toFixed(1)}% is below required threshold`;
       console.warn(`[Webhook] ${reason}`);
 
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -219,6 +254,7 @@ export class WebhookController {
         status: 'REJECTED',
         rejectionReason: reason,
         mlScore: mlResponse.probability,
+        mlMode: mlResponse.mode,
         rmsPassed: true,
         indicatorsPassed: true,
         filtersPassed: true,
@@ -231,6 +267,7 @@ export class WebhookController {
       res.status(422).json({
         status: 'REJECTED',
         signalId,
+        correlationId,
         stage: 'ML_GATEKEEPER',
         reason,
         probability: mlResponse.probability,
@@ -248,6 +285,8 @@ export class WebhookController {
 
       await SignalModel.create({
         signalId,
+        correlationId,
+        idempotencyKey,
         symbol,
         action,
         direction,
@@ -262,6 +301,7 @@ export class WebhookController {
         status: 'REJECTED',
         rejectionReason: reason,
         mlScore: mlResponse.probability,
+        mlMode: mlResponse.mode,
         rmsPassed: false,
         rawPayload: payload,
       });
@@ -269,13 +309,14 @@ export class WebhookController {
       res.status(429).json({
         status: 'REJECTED',
         signalId,
+        correlationId,
         stage: 'ATOMIC_LOCK',
         reason,
       });
       return;
     }
 
-    // 7. All Checks Passed -> Execute Paper Trade with Execution Realism & State Machine
+    // 7. All Checks Passed -> Execute Paper Trade
     const tradeId = `TRADE_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     const atr = indicatorEval.atr > 0 ? indicatorEval.atr : price * 0.01;
 
@@ -292,7 +333,7 @@ export class WebhookController {
 
     const tradeDateIST = getTodayISTDateString();
     const token = payload.symbol || 'NIFTY_ATM';
-    const quantity = 50; // Standard 1-lot Nifty option quantity
+    const quantity = parseInt(process.env.NIFTY_LOT_SIZE || '50', 10);
     const slippagePercent = 0.002; // 0.2% slippage on option premium
 
     const grossEntryPrice = price;
@@ -301,6 +342,8 @@ export class WebhookController {
     // Save Executed Signal Telemetry
     await SignalModel.create({
       signalId,
+      correlationId,
+      idempotencyKey,
       symbol,
       action,
       direction,
@@ -315,6 +358,7 @@ export class WebhookController {
       status: 'EXECUTED',
       rejectionReason: null,
       mlScore: mlResponse.probability,
+      mlMode: mlResponse.mode,
       rmsPassed: true,
       indicatorsPassed: true,
       filtersPassed: true,
@@ -327,6 +371,8 @@ export class WebhookController {
     // Create PaperTrade with strict lifecycle state machine
     await PaperTradeModel.create({
       tradeId,
+      correlationId,
+      idempotencyKey,
       symbol,
       token,
       action,
@@ -350,6 +396,7 @@ export class WebhookController {
       exitReason: 'NONE',
       slippagePercent,
       mlProbability: mlResponse.probability,
+      mlMode: mlResponse.mode,
       tradeDateIST,
       features: featureVector,
     });
@@ -357,6 +404,8 @@ export class WebhookController {
     // Register active paper trade in RAM worker
     TrackerWorker.registerPosition({
       tradeId,
+      correlationId,
+      idempotencyKey,
       symbol,
       token,
       action,
@@ -371,12 +420,13 @@ export class WebhookController {
       selectedStrike: strike,
     });
 
-    console.log(`[Webhook] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId} | Strike: ${strike}`);
+    console.log(`[Webhook] SUCCESS: Paper Trade Executed! Trade ID: ${tradeId} | Correlation: ${correlationId} | Strike: ${strike}`);
 
     res.status(201).json({
       status: 'EXECUTED',
       signalId,
       tradeId,
+      correlationId,
       symbol,
       action,
       direction,
