@@ -18,7 +18,8 @@ export class TrackerWorker {
   private static reconnectTimer: NodeJS.Timeout | null = null;
   private static reconnectAttempts = 0;
   private static readonly maxReconnectDelayMs = 30000;
-  private static readonly baseReconnectDelayMs = 1000;
+  private static readonly baseReconnectDelayMs = 3000;
+  private static readonly baseAuthDelayMs = 4000; // 3-5s base delay for auth & rate limit backoff
   private static isConnecting = false;
 
   // 401 Interceptor & Self-Healing Exponential Backoff state
@@ -398,6 +399,20 @@ export class TrackerWorker {
         console.log('[TrackerWorker] SmartAPI Control Message:', JSON.stringify(parsed));
       }
 
+      // Check for SmartAPI rate limit or auth failure messages
+      const msgLower = String(parsed.message || parsed.text || '').toLowerCase();
+      if (
+        msgLower.includes('exceeding access rate') ||
+        msgLower.includes('access denied') ||
+        msgLower.includes('unauthorized') ||
+        parsed.errorcode === 'AB1004' ||
+        parsed.errorcode === 'AG8001'
+      ) {
+        console.warn(`[TrackerWorker] SmartAPI Rate Limit / Auth Error in Control Message: ${parsed.message || parsed.text}`);
+        this.handle401Error(parsed.message || parsed.text);
+        return;
+      }
+
       // Handle fallback JSON tick format if transmitted in dev/mock environments
       if (parsed.token && (parsed.last_traded_price !== undefined || parsed.price !== undefined || parsed.ltp !== undefined)) {
         const rawPrice = parsed.last_traded_price ?? parsed.price ?? parsed.ltp;
@@ -424,9 +439,9 @@ export class TrackerWorker {
   }
 
   /**
-   * Self-healing 401 Unauthorized Interceptor with exponential backoff & max 5 retry threshold
+   * Self-healing 401 Unauthorized & Rate Limit Interceptor with exponential backoff & max 5 retry threshold
    */
-  private static async handle401Error(): Promise<void> {
+  public static async handle401Error(reason?: string): Promise<void> {
     if (this.isHandling401) {
       return;
     }
@@ -436,24 +451,26 @@ export class TrackerWorker {
 
     if (this.authFailureAttempts >= this.maxAuthFailureAttempts) {
       console.error(
-        `[TrackerWorker] Max auth retry attempts (${this.maxAuthFailureAttempts}) reached due to persistent 401 Unauthorized errors. Halting auto-reconnect.`
+        `[TrackerWorker] Max auth retry attempts (${this.maxAuthFailureAttempts}) reached due to persistent auth / rate-limit errors. Halting auto-reconnect.`
       );
       this.isHandling401 = false;
       return;
     }
 
     this.authFailureAttempts++;
-    console.log('[TrackerWorker] SmartAPI 401 Unauthorized detected. Invalidation and refreshing session credentials...');
+    const reasonMsg = reason || '401 Unauthorized / Rate Limit detected';
+    console.warn(`[TrackerWorker] SmartAPI ${reasonMsg}. Invalidating session and backing off before re-authentication...`);
 
     invalidateSmartApiSession();
 
+    // Exponential backoff starting with baseAuthDelayMs (4s, within 3-5s range) to prevent rate limit storms
     const delay = Math.min(
-      this.baseReconnectDelayMs * Math.pow(2, this.authFailureAttempts - 1),
+      this.baseAuthDelayMs * Math.pow(2, this.authFailureAttempts - 1),
       this.maxReconnectDelayMs
     );
 
     console.warn(
-      `[TrackerWorker] Scheduling 401 self-healing reconnect in ${(delay / 1000).toFixed(1)}s (Attempt #${this.authFailureAttempts}/${this.maxAuthFailureAttempts})...`
+      `[TrackerWorker] Scheduling auth/rate-limit self-healing reconnect in ${(delay / 1000).toFixed(1)}s (Attempt #${this.authFailureAttempts}/${this.maxAuthFailureAttempts})...`
     );
 
     if (this.reconnectTimer) {
@@ -467,7 +484,7 @@ export class TrackerWorker {
         this.isHandling401 = false;
         await this.connectSmartApiWebSocket();
       } catch (err: any) {
-        console.error('[TrackerWorker] Error during 401 self-healing reconnect:', err.message);
+        console.error('[TrackerWorker] Error during auth/rate-limit self-healing reconnect:', err.message);
         this.isHandling401 = false;
         this.scheduleReconnect();
       }
@@ -505,7 +522,7 @@ export class TrackerWorker {
   /**
    * Clean up WebSocket instance & ping intervals safely
    */
-  private static cleanupSocketState(): void {
+  public static cleanupSocketState(): void {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
@@ -513,17 +530,35 @@ export class TrackerWorker {
     if (this.wsClient) {
       try {
         this.wsClient.removeAllListeners();
+        this.wsClient.on('error', () => {}); // no-op error catcher to suppress uncaught crash
         if (
           this.wsClient.readyState === WebSocket.OPEN ||
           this.wsClient.readyState === WebSocket.CONNECTING
         ) {
           this.wsClient.terminate();
         }
-      } catch {
-        // Ignore termination errors during cleanup
+      } catch (err) {
+        console.warn('[TrackerWorker] Non-critical error while terminating WebSocket:', err);
+      } finally {
+        this.wsClient = null;
       }
-      this.wsClient = null;
     }
+  }
+
+  public static getWsClient(): WebSocket | null {
+    return this.wsClient;
+  }
+
+  public static setWsClient(client: WebSocket | null): void {
+    this.wsClient = client;
+  }
+
+  public static getAuthFailureAttempts(): number {
+    return this.authFailureAttempts;
+  }
+
+  public static resetAuthFailureAttempts(): void {
+    this.authFailureAttempts = 0;
   }
 
   /**
@@ -561,6 +596,12 @@ export class TrackerWorker {
       return;
     }
 
+    if (session.jwtToken.startsWith('fallback')) {
+      console.warn('[TrackerWorker] SmartAPI session is in fallback state (authentication failed or rate limited). Backing off before retry...');
+      this.handle401Error('Session in fallback state');
+      return;
+    }
+
     this.isConnecting = true;
     const apiKey = process.env.SMARTAPI_API_KEY || '';
     const wsUrl = 'wss://smartapisocket.angelone.in/smart-stream';
@@ -583,8 +624,8 @@ export class TrackerWorker {
 
       this.wsClient.on('unexpected-response', (_req, res) => {
         console.error(`[TrackerWorker] WebSocket unexpected server response: ${res.statusCode} ${res.statusMessage}`);
-        if (res.statusCode === 401) {
-          this.handle401Error();
+        if (res.statusCode === 401 || res.statusCode === 429 || res.statusCode === 403) {
+          this.handle401Error(`HTTP ${res.statusCode} ${res.statusMessage}`);
         }
       });
 
@@ -675,12 +716,17 @@ export class TrackerWorker {
           this.pingInterval = null;
         }
 
+        const errLower = err.message.toLowerCase();
         if (
           err.message.includes('401') ||
-          err.message.toLowerCase().includes('unauthorized') ||
-          err.message.includes('Unexpected server response: 401')
+          errLower.includes('unauthorized') ||
+          err.message.includes('Unexpected server response: 401') ||
+          errLower.includes('exceeding access rate') ||
+          errLower.includes('access rate') ||
+          errLower.includes('rate limit') ||
+          err.message.includes('429')
         ) {
-          this.handle401Error();
+          this.handle401Error(err.message);
         }
       });
 
@@ -704,11 +750,16 @@ export class TrackerWorker {
       if (e.stack) {
         console.error('[TrackerWorker] Exception stack trace:', e.stack);
       }
+      const eLower = (e.message || '').toLowerCase();
       if (
         e.message?.includes('401') ||
-        e.message?.toLowerCase().includes('unauthorized')
+        eLower.includes('unauthorized') ||
+        eLower.includes('exceeding access rate') ||
+        eLower.includes('access rate') ||
+        eLower.includes('rate limit') ||
+        e.message?.includes('429')
       ) {
-        this.handle401Error();
+        this.handle401Error(e.message);
       } else if (this.isMarketSessionActive || this.isMarketHours()) {
         TrackerWorker.scheduleReconnect();
       }
@@ -759,25 +810,7 @@ export class TrackerWorker {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-
-    if (this.wsClient) {
-      try {
-        this.wsClient.removeAllListeners();
-        if (
-          this.wsClient.readyState === WebSocket.OPEN ||
-          this.wsClient.readyState === WebSocket.CONNECTING
-        ) {
-          this.wsClient.close(1000, 'Normal Closure');
-        }
-      } catch (err: any) {
-        console.error('[TrackerWorker] Error during WebSocket closure:', err.message);
-      }
-      this.wsClient = null;
-    }
+    this.cleanupSocketState();
 
     console.log('[TrackerWorker] Market session closed. WebSocket safely disconnected for overnight idle.');
   }

@@ -1,5 +1,6 @@
 import assert from 'assert';
 import crypto from 'crypto';
+import WebSocket from 'ws';
 import { TrackerWorker } from '../services/trackerWorker';
 import { CandleManager } from '../engine/candleManager';
 import { requireAdminAuth } from '../middleware/authMiddleware';
@@ -173,6 +174,29 @@ async function runTests() {
     assert.strictEqual(result.closed5m.high, 24120);
     assert.strictEqual(result.closed5m.close, 24120);
     assert.strictEqual(mgr.get5mCandles().length, 1, 'Candle must be retained in memory for indicator calculation');
+  });
+
+  // Test 10: WebSocket Safe Cleanup Suppresses Unhandled Error Event in CONNECTING state
+  await test('WebSocket Safe Cleanup Suppresses Unhandled Error Event in CONNECTING state', () => {
+    // Instantiate a WebSocket in CONNECTING state pointing to an unopen port
+    const ws = new WebSocket('ws://127.0.0.1:59999');
+    assert.strictEqual(ws.readyState, WebSocket.CONNECTING);
+
+    TrackerWorker.setWsClient(ws);
+    // cleanupSocketState must safely terminate the socket, catch the unhandled error, and nullify wsClient
+    TrackerWorker.cleanupSocketState();
+
+    assert.strictEqual(TrackerWorker.getWsClient(), null, 'wsClient must be safely nullified');
+  });
+
+  // Test 11: 401 & Rate Limit Exponential Backoff Handling
+  await test('SmartAPI 401 & Rate Limit Backoff Interceptor', async () => {
+    TrackerWorker.resetAuthFailureAttempts();
+    assert.strictEqual(TrackerWorker.getAuthFailureAttempts(), 0);
+
+    // Trigger 401 error handler with rate limit message
+    await TrackerWorker.handle401Error('Access denied because of exceeding access rate');
+    assert.strictEqual(TrackerWorker.getAuthFailureAttempts(), 1, 'Auth failure attempt count should increment');
   });
 
   console.log('\n=====================================================');
