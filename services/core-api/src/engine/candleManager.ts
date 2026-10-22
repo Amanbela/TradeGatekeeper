@@ -56,6 +56,30 @@ export class CandleManager {
   }
 
   /**
+   * Time check helper based on IST timezone (Asia/Kolkata).
+   * Returns true if the time is before 09:15 AM IST (< 555 minutes from midnight).
+   * During pre-market warmup (08:45 AM - 09:15 AM IST), candle and indicator state
+   * (EMA, SMA, ATR) update normally, but strategy signal evaluation and dispatch are explicitly bypassed.
+   */
+  public static isBeforeMarketOpenIST(time?: Date | number): boolean {
+    const timeIST = time !== undefined ? moment(time).tz('Asia/Kolkata') : moment().tz('Asia/Kolkata');
+    const minutesFromMidnight = timeIST.hours() * 60 + timeIST.minutes();
+    return minutesFromMidnight < 555; // 09:15 AM IST = 9 * 60 + 15 = 555 minutes
+  }
+
+  public static isPreMarketWarmup(time?: Date | number): boolean {
+    return CandleManager.isBeforeMarketOpenIST(time);
+  }
+
+  public isBeforeMarketOpenIST(time?: Date | number): boolean {
+    return CandleManager.isBeforeMarketOpenIST(time);
+  }
+
+  public isPreMarketWarmup(time?: Date | number): boolean {
+    return CandleManager.isBeforeMarketOpenIST(time);
+  }
+
+  /**
    * Helper method to process ticks using token and price directly
    */
   public onTickReceived(token: string, price: number, volume: number = 1): { closed5m?: OHLCV; closed15m?: OHLCV } {
@@ -184,8 +208,14 @@ export class CandleManager {
           `[CandleManager] 5M Candle Closed for ${this.symbol} (${isIncomplete ? 'PARTIAL/INCOMPLETE' : 'FULL'}): O=${closed5m.open} H=${closed5m.high} L=${closed5m.low} C=${closed5m.close} V=${closed5m.volume} at ${timeIST}`
         );
 
-        // 3. Partial Candle Protection: Suppress automatic signal generation if candle is incomplete!
-        if (!isIncomplete) {
+        // 3. Pre-Market Warmup Check (< 09:15 AM IST / < 555 minutes from midnight):
+        // Allow indicators to update normally for historical warmup, but explicitly bypass calling
+        // the strategy evaluation and signal dispatch pipeline.
+        if (this.isBeforeMarketOpenIST() || (closed5m.timestamp && CandleManager.isBeforeMarketOpenIST(closed5m.timestamp))) {
+          console.log(
+            `[CandleManager] Pre-market warmup active (< 09:15 AM IST). Indicator state updated, signal evaluation bypassed.`
+          );
+        } else if (!isIncomplete) {
           InternalSignalDispatcher.evaluateOnCandleClose(this.symbol, closed5m).catch((err) => {
             console.error(`[CandleManager] Error evaluating signal on 5M candle close for ${this.symbol}:`, err);
           });

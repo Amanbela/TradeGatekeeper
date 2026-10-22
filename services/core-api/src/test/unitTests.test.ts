@@ -137,6 +137,44 @@ async function runTests() {
     assert.strictEqual(gatingRes.approved, false, 'Gating mode must fail-closed when ML service is offline');
   });
 
+  // Test 8: IST Pre-Market Warmup Time Check Helper (< 09:15 AM IST)
+  await test('IST Pre-Market Warmup Time Check Helper (< 09:15 AM IST)', () => {
+    // 08:45 AM IST (525 mins) -> pre-market
+    const preMarketTime = new Date('2026-10-22T08:45:00+05:30');
+    assert.strictEqual(CandleManager.isBeforeMarketOpenIST(preMarketTime), true, '08:45 AM IST must be identified as pre-market warmup');
+
+    // 09:14 AM IST (554 mins) -> pre-market
+    const justBeforeOpen = new Date('2026-10-22T09:14:59+05:30');
+    assert.strictEqual(CandleManager.isBeforeMarketOpenIST(justBeforeOpen), true, '09:14:59 AM IST must be identified as pre-market warmup');
+
+    // 09:15 AM IST (555 mins) -> market open
+    const marketOpenTime = new Date('2026-10-22T09:15:00+05:30');
+    assert.strictEqual(CandleManager.isBeforeMarketOpenIST(marketOpenTime), false, '09:15:00 AM IST must not be pre-market warmup');
+
+    // 09:30 AM IST (570 mins) -> regular trading hours
+    const regularTradingTime = new Date('2026-10-22T09:30:00+05:30');
+    assert.strictEqual(CandleManager.isBeforeMarketOpenIST(regularTradingTime), false, '09:30 AM IST must not be pre-market warmup');
+  });
+
+  // Test 9: Pre-Market Candle Warmup Aggregation Without Signal Evaluation
+  await test('Pre-Market Warmup Aggregates Candles for Indicators and Bypasses Signals', () => {
+    const mgr = new CandleManager('NIFTY_TEST_WARMUP');
+    const baseTime = new Date('2026-10-22T08:50:00+05:30').getTime();
+
+    // Tick 1 at 08:50 AM
+    mgr.processTick({ symbol: 'NIFTY_TEST_WARMUP', token: '26000', price: 24100, volume: 50, timestamp: baseTime });
+    // Tick 2 at 08:52 AM
+    mgr.processTick({ symbol: 'NIFTY_TEST_WARMUP', token: '26000', price: 24120, volume: 60, timestamp: baseTime + 2 * 60 * 1000 });
+    // Tick 3 at 08:55 AM (triggers 5m candle closure for the 08:50 candle)
+    const result = mgr.processTick({ symbol: 'NIFTY_TEST_WARMUP', token: '26000', price: 24110, volume: 40, timestamp: baseTime + 5 * 60 * 1000 });
+
+    assert(result.closed5m, '5M candle must be closed and returned');
+    assert.strictEqual(result.closed5m.open, 24100);
+    assert.strictEqual(result.closed5m.high, 24120);
+    assert.strictEqual(result.closed5m.close, 24120);
+    assert.strictEqual(mgr.get5mCandles().length, 1, 'Candle must be retained in memory for indicator calculation');
+  });
+
   console.log('\n=====================================================');
   console.log(`   Test Results: ${passedCount} / ${totalCount} Passed`);
   console.log('=====================================================');

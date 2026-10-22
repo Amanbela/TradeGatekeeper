@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import moment from 'moment-timezone';
 import { OHLCV, FilterChecks, MlFeatureVector } from '../types';
 import { RMSService } from '../services/rmsService';
-import { getCandleManager } from './candleManager';
+import { CandleManager, getCandleManager } from './candleManager';
 import { GainzAlgoEngine } from './gainzAlgoEngine';
 import { OptionFilters } from './optionFilters';
 import { MlClient } from '../services/mlClient';
@@ -19,6 +19,12 @@ export class InternalSignalDispatcher {
    * and executes paper trades self-containedly without TradingView webhooks.
    */
   public static async evaluateOnCandleClose(symbol: string, closed5m: OHLCV): Promise<void> {
+    // Defense-in-depth safety check: bypass signal evaluation before market open (< 09:15 AM IST)
+    if (CandleManager.isBeforeMarketOpenIST() || (closed5m.timestamp && CandleManager.isBeforeMarketOpenIST(closed5m.timestamp))) {
+      console.log(`[CandleManager] Pre-market warmup active (< 09:15 AM IST). Indicator state updated, signal evaluation bypassed.`);
+      return;
+    }
+
     const signalId = uuidv4();
     const correlationId = uuidv4();
     const now = new Date();
